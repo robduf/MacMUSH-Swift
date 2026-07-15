@@ -1,0 +1,15 @@
+# SwiftPM build output
+.build/
+.swiftpm/
+dist/
+
+# Xcode (if you ever open it there)
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# local helper (not part of the project)
+/Push to GitHub.command

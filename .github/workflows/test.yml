@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build + engine tests (macOS)
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # Compiles every target, including the AppKit app — a full compile check.
+      - name: Build
+        run: swift build
+
+      # Runs the MudEngine unit suite (telnet + ANSI parsing).
+      - name: Test
+        run: swift test
