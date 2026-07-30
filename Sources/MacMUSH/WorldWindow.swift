@@ -15,12 +15,23 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     private var ansi = AnsiParser()
     private var connection: MudConnection?
 
+    private var config = Storage.loadWorld()
+    private var isConnected = false
+    private var currentHost = ""
+    private var currentPort: UInt16 = 0
+
     private var history: [String] = []
     private var historyIndex = -1
     private var draft = ""
     private var echoOn = true
-    private var currentHost = ""
-    private var currentPort: UInt16 = 0
+
+    // Incoming lines are assembled here so triggers can match a whole line.
+    private var pendingOps: [AnsiOp] = []
+    private var pendingPlain = ""
+
+    // Timer scheduling: next fire date per timer id.
+    private var timerFireDates: [String: Date] = [:]
+    private var tickTimer: Timer?
 
     override init() {
         window = NSWindow(
@@ -106,8 +117,9 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     private func showWelcome() {
         appendSystem("MacMUSH — a native Swift MUD client.")
-        appendSystem("Press ⌘R to connect. For a test target, run:  node scripts/fake-mud.js")
-        appendSystem("then connect to 127.0.0.1 port 4000.\n")
+        appendSystem("Press ⌘R to connect (saved: \(config.host) \(config.port)).")
+        appendSystem("Type /help for triggers, aliases and timers. They're saved between sessions.")
+        appendSystem("Test target:  node scripts/fake-mud.js  →  connect to 127.0.0.1 4000.\n")
     }
 
     // MARK: Connection
@@ -116,22 +128,32 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         disconnect()
         currentHost = host
         currentPort = port
+        config.host = host
+        config.port = port
+        saveConfig()
         ansi.resetStyle()
+        pendingOps = []
+        pendingPlain = ""
         appendSystem("Connecting to \(host):\(port)…")
 
         let conn = MudConnection(host: host, port: port)
         conn.onText = { [weak self] text in self?.render(text) }
-        conn.onPrompt = { [weak self] in self?.render("\n") }
+        conn.onPrompt = { [weak self] in self?.flushLine(isPrompt: true) }
         conn.onEcho = { [weak self] on in self?.setEcho(on) }
         conn.onStateChange = { [weak self] connected, message in
             guard let self = self else { return }
+            self.isConnected = connected
             if connected {
                 self.statusLabel.stringValue = "Connected to \(self.currentHost):\(self.currentPort)"
                 self.appendSystem("Connected.")
+                self.sendConnectText()
+                self.armTimers()
+                self.startTicker()
             } else {
                 self.statusLabel.stringValue = "Not connected"
                 if let message = message { self.appendSystem(message) }
                 self.setEcho(true)
+                self.stopTicker()
             }
         }
         conn.start()
@@ -141,6 +163,20 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     func disconnect() {
         connection?.disconnect()
         connection = nil
+        isConnected = false
+        stopTicker()
+    }
+
+    /// Connect using the saved world's host/port.
+    func connectDefault() {
+        connect(host: config.host, port: config.port)
+    }
+
+    private func sendConnectText() {
+        for line in config.connectText.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+            send(line, echo: false)
+        }
     }
 
     func promptConnect() {
@@ -148,7 +184,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         alert.messageText = "Connect to a MUD"
         alert.informativeText = "Enter a host and port (e.g. 127.0.0.1 4000)."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.stringValue = currentHost.isEmpty ? "127.0.0.1 4000" : "\(currentHost) \(currentPort)"
+        field.stringValue = "\(config.host) \(config.port)"
         alert.accessoryView = field
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -163,13 +199,46 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         }
     }
 
-    // MARK: Output
+    // MARK: Incoming — line assembly + triggers
 
     private func render(_ text: String) {
-        let ops = ansi.feed(text)
-        renderer.append(ops, to: textView)
-        textView.scrollToEndOfDocument(nil)
+        for op in ansi.feed(text) {
+            switch op {
+            case .text(let styled):
+                pendingOps.append(op)
+                pendingPlain += styled.text
+            case .newline:
+                flushLine(isPrompt: false)
+            case .bell:
+                NSSound.beep()
+            }
+        }
     }
+
+    private func flushLine(isPrompt: Bool) {
+        if pendingOps.isEmpty && pendingPlain.isEmpty && isPrompt { return }
+
+        let plain = pendingPlain
+        let lineOps = pendingOps
+        pendingOps = []
+        pendingPlain = ""
+
+        var gagged = false
+        if !isPrompt {
+            let result = Matcher.evaluate(config.triggers, line: plain)
+            gagged = result.gag
+            for match in result.matches where !match.sendText.isEmpty {
+                send(match.sendText, echo: false)
+            }
+        }
+
+        if !gagged {
+            renderer.append(lineOps + [.newline], to: textView)
+            textView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    // MARK: Output helpers
 
     private func appendSystem(_ message: String) {
         let color = NSColor(srgbRed: 0.53, green: 0.53, blue: 0.80, alpha: 1)
@@ -183,19 +252,46 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         textView.scrollToEndOfDocument(nil)
     }
 
+    // MARK: Sending
+
+    /// Send one or more lines to the MUD (multi-line text is split on "\n").
+    private func send(_ text: String, echo: Bool) {
+        guard connection != nil else {
+            appendSystem("Not connected.")
+            return
+        }
+        for line in text.components(separatedBy: "\n") {
+            connection?.send(line)
+            if echo && echoOn { appendEcho(line) }
+        }
+    }
+
     // MARK: Input
 
     @objc private func sendFromInput() {
-        let line = input.stringValue
+        let raw = input.stringValue
         input.stringValue = ""
-        if !line.isEmpty && history.last != line {
-            history.append(line)
+        if !raw.isEmpty && history.last != raw {
+            history.append(raw)
             if history.count > 200 { history.removeFirst() }
         }
         historyIndex = -1
         draft = ""
-        if echoOn { appendEcho(line) }
-        connection?.send(line)
+
+        if raw.hasPrefix("/") {
+            handleCommand(raw)
+            return
+        }
+
+        let result = Matcher.evaluate(config.aliases, line: raw)
+        if result.matches.isEmpty {
+            send(raw, echo: true)
+        } else {
+            if echoOn { appendEcho(raw) }
+            for match in result.matches where !match.sendText.isEmpty {
+                send(match.sendText, echo: false)
+            }
+        }
     }
 
     private func setEcho(_ on: Bool) {
@@ -203,7 +299,190 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         input.placeholderString = on ? "Type a command…" : "Password (hidden)…"
     }
 
-    // Arrow-key history recall.
+    // MARK: Timers
+
+    private func armTimers() {
+        let now = Date()
+        timerFireDates.removeAll()
+        for timer in config.timers where timer.enabled {
+            timerFireDates[timer.id] = now.addingTimeInterval(timer.seconds)
+        }
+    }
+
+    private func startTicker() {
+        tickTimer?.invalidate()
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    private func stopTicker() {
+        tickTimer?.invalidate()
+        tickTimer = nil
+    }
+
+    private func tick() {
+        guard isConnected else { return }
+        let now = Date()
+        var changed = false
+        for timer in config.timers where timer.enabled {
+            guard let fire = timerFireDates[timer.id], fire <= now else { continue }
+            if !timer.sendText.isEmpty { send(timer.sendText, echo: false) }
+            if timer.oneShot {
+                if let idx = config.timers.firstIndex(where: { $0.id == timer.id }) {
+                    config.timers[idx].enabled = false
+                }
+                timerFireDates[timer.id] = nil
+                changed = true
+            } else {
+                timerFireDates[timer.id] = now.addingTimeInterval(timer.seconds)
+            }
+        }
+        if changed { saveConfig() }
+    }
+
+    // MARK: Persistence
+
+    private func saveConfig() {
+        Storage.saveWorld(config)
+    }
+
+    // MARK: Slash commands
+
+    private enum RuleKind { case trigger, alias }
+
+    private func handleCommand(_ raw: String) {
+        let body = String(raw.dropFirst())
+        let spaceIdx = body.firstIndex(of: " ")
+        let cmd = (spaceIdx.map { String(body[..<$0]) } ?? body).lowercased()
+        let rest = spaceIdx.map { String(body[body.index(after: $0)...]) } ?? ""
+
+        switch cmd {
+        case "help", "?":
+            showHelp()
+        case "connect":
+            let parts = rest.split { $0 == " " || $0 == ":" }.map(String.init)
+            if parts.count >= 2, let p = UInt16(parts[1]) { connect(host: parts[0], port: p) }
+            else { connectDefault() }
+        case "disconnect":
+            disconnect()
+            appendSystem("Disconnected.")
+        case "alias":
+            addRule(rest, kind: .alias)
+        case "trigger":
+            addRule(rest, kind: .trigger)
+        case "timer":
+            addTimer(rest)
+        case "aliases":
+            listRules(config.aliases, label: "Aliases")
+        case "triggers":
+            listRules(config.triggers, label: "Triggers")
+        case "timers":
+            listTimers()
+        case "rmalias":
+            removeRule(rest, kind: .alias)
+        case "rmtrigger":
+            removeRule(rest, kind: .trigger)
+        case "rmtimer":
+            removeTimer(rest)
+        default:
+            appendSystem("Unknown command: /\(cmd). Type /help.")
+        }
+    }
+
+    private func addRule(_ spec: String, kind: RuleKind) {
+        guard let eq = spec.firstIndex(of: "=") else {
+            appendSystem("Usage: /\(kind == .alias ? "alias" : "trigger") <pattern>=<send>")
+            return
+        }
+        let pattern = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
+        let sendText = String(spec[spec.index(after: eq)...])
+        guard !pattern.isEmpty else { appendSystem("Pattern can't be empty."); return }
+        let rule = MatchRule(pattern: pattern, sendText: sendText)
+        if kind == .alias { config.aliases.append(rule) } else { config.triggers.append(rule) }
+        saveConfig()
+        appendSystem("Added \(kind == .alias ? "alias" : "trigger"): \(pattern)  →  \(sendText)")
+    }
+
+    private func addTimer(_ spec: String) {
+        guard let eq = spec.firstIndex(of: "=") else {
+            appendSystem("Usage: /timer <seconds>=<send>")
+            return
+        }
+        let secStr = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
+        let sendText = String(spec[spec.index(after: eq)...])
+        guard let seconds = Double(secStr), seconds > 0 else {
+            appendSystem("Seconds must be a positive number.")
+            return
+        }
+        let timer = MudTimer(seconds: seconds, sendText: sendText)
+        config.timers.append(timer)
+        if isConnected { timerFireDates[timer.id] = Date().addingTimeInterval(seconds) }
+        saveConfig()
+        appendSystem("Added timer: every \(secStr)s  →  \(sendText)")
+    }
+
+    private func listRules(_ rules: [MatchRule], label: String) {
+        guard !rules.isEmpty else { appendSystem("\(label): (none)"); return }
+        appendSystem("\(label):")
+        for (i, r) in rules.enumerated() {
+            let flags = (r.enabled ? "" : " [off]") + (r.gag ? " [gag]" : "") + (r.isRegex ? " [regex]" : "")
+            appendSystem("  \(i + 1). \(r.pattern)  →  \(r.sendText)\(flags)")
+        }
+    }
+
+    private func listTimers() {
+        guard !config.timers.isEmpty else { appendSystem("Timers: (none)"); return }
+        appendSystem("Timers:")
+        for (i, t) in config.timers.enumerated() {
+            let flags = (t.enabled ? "" : " [off]") + (t.oneShot ? " [once]" : "")
+            appendSystem("  \(i + 1). every \(t.seconds)s  →  \(t.sendText)\(flags)")
+        }
+    }
+
+    private func removeRule(_ arg: String, kind: RuleKind) {
+        guard let n = Int(arg.trimmingCharacters(in: .whitespaces)), n >= 1 else {
+            appendSystem("Usage: /rm\(kind == .alias ? "alias" : "trigger") <number>")
+            return
+        }
+        if kind == .alias {
+            guard n <= config.aliases.count else { appendSystem("No alias #\(n)."); return }
+            appendSystem("Removed alias: \(config.aliases.remove(at: n - 1).pattern)")
+        } else {
+            guard n <= config.triggers.count else { appendSystem("No trigger #\(n)."); return }
+            appendSystem("Removed trigger: \(config.triggers.remove(at: n - 1).pattern)")
+        }
+        saveConfig()
+    }
+
+    private func removeTimer(_ arg: String) {
+        guard let n = Int(arg.trimmingCharacters(in: .whitespaces)), n >= 1, n <= config.timers.count else {
+            appendSystem("Usage: /rmtimer <number>")
+            return
+        }
+        let removed = config.timers.remove(at: n - 1)
+        timerFireDates[removed.id] = nil
+        saveConfig()
+        appendSystem("Removed timer: every \(removed.seconds)s")
+    }
+
+    private func showHelp() {
+        let lines = [
+            "Commands (rules are saved between sessions):",
+            "  /connect [host port]        connect (defaults to saved world)",
+            "  /disconnect",
+            "  /alias <pattern>=<send>     e.g.  /alias gt * *=give %2 to %1",
+            "  /trigger <pattern>=<send>   e.g.  /trigger * tells you *=wave",
+            "  /timer <seconds>=<send>     e.g.  /timer 60=look",
+            "  /aliases  /triggers  /timers    list them",
+            "  /rmalias N  /rmtrigger N  /rmtimer N    remove by number",
+            "  Use * as a wildcard; %1..%9 insert wildcards into the send text.",
+        ]
+        for line in lines { appendSystem(line) }
+    }
+
+    // MARK: History (arrow keys)
+
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.moveUp(_:)) {
             recallHistory(delta: -1)
