@@ -57,6 +57,23 @@ final class AnsiParserTests: XCTestCase {
         XCTAssertEqual(kinds, ["text", "newline", "text", "newline", "text"])
     }
 
+    func testCRLFLineEndings() {
+        // MUDs almost always send CRLF. Swift groups "\r\n" into one Character,
+        // so the parser must iterate unicode scalars to see the "\n" — otherwise
+        // every line runs together.
+        var p = AnsiParser()
+        let ops = p.feed("alpha\r\nbeta\r\ngamma")
+        let kinds: [String] = ops.map {
+            switch $0 {
+            case .text: return "text"
+            case .newline: return "newline"
+            case .bell: return "bell"
+            }
+        }
+        XCTAssertEqual(kinds, ["text", "newline", "text", "newline", "text"])
+        XCTAssertEqual(textOps(ops).map { $0.text }, ["alpha", "beta", "gamma"])
+    }
+
     func testStylePersistsAcrossChunks() {
         var p = AnsiParser()
         _ = p.feed("\u{1B}[35m")

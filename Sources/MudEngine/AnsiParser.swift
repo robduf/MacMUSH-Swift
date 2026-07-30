@@ -29,49 +29,55 @@ public struct AnsiParser {
             }
         }
 
-        for ch in str {
+        // Iterate unicode scalars, NOT Characters: Swift treats "\r\n" as a
+        // single grapheme-cluster Character, so a Character-based loop never
+        // matches "\n" or "\r" on CRLF line endings and the lines run together.
+        for scalar in str.unicodeScalars {
+            let v = scalar.value
             switch state {
             case .text:
-                if ch == "\u{1B}" {            // ESC
+                if scalar == "\u{1B}" {            // ESC
                     flush()
                     state = .esc
-                } else if ch == "\n" {
+                } else if scalar == "\n" {
                     flush()
                     ops.append(.newline)
-                } else if ch == "\r" {
+                } else if scalar == "\r" {
                     // swallow; newlines are driven by \n
-                } else if ch == "\u{07}" {     // BEL
+                } else if scalar == "\u{07}" {     // BEL
                     flush()
                     ops.append(.bell)
-                } else if ch == "\t" {
-                    text += "        "          // simple 8-space tab
-                } else if let a = ch.asciiValue, a < 0x20 {
+                } else if scalar == "\t" {
+                    text += "        "             // simple 8-space tab
+                } else if v < 0x20 {
                     // swallow other C0 control characters
                 } else {
-                    text.append(ch)
+                    text.unicodeScalars.append(scalar)
                 }
 
             case .esc:
-                if ch == "[" { csiBuffer = ""; state = .csi }
-                else if ch == "]" { state = .osc }
-                else { state = .text }         // other escapes: ignore
+                if scalar == "[" { csiBuffer = ""; state = .csi }
+                else if scalar == "]" { state = .osc }
+                else { state = .text }             // other escapes: ignore
 
             case .csi:
-                if ch.isNumber || ch == ";" || ch == ":" || "?=><! ".contains(ch) {
-                    csiBuffer.append(ch)
-                    if csiBuffer.count > 64 { state = .text } // runaway guard
+                // CSI parameter / intermediate bytes are 0x20–0x3F; the final
+                // byte (0x40–0x7E) ends the sequence.
+                if v >= 0x20 && v <= 0x3F {
+                    csiBuffer.unicodeScalars.append(scalar)
+                    if csiBuffer.utf8.count > 64 { state = .text } // runaway guard
                 } else {
-                    if ch == "m" { applySGR(csiBuffer) }
+                    if scalar == "m" { applySGR(csiBuffer) }
                     // all other CSI finals (cursor moves, erase, …) are ignored
                     state = .text
                 }
 
             case .osc:
-                if ch == "\u{07}" { state = .text }
-                else if ch == "\u{1B}" { state = .oscEsc }
+                if scalar == "\u{07}" { state = .text }
+                else if scalar == "\u{1B}" { state = .oscEsc }
 
             case .oscEsc:
-                if ch == "\\" { state = .text } else { state = .osc }
+                if scalar == "\\" { state = .text } else { state = .osc }
             }
         }
 
