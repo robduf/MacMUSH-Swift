@@ -462,8 +462,11 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         }
         let secStr = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
         let sendText = String(spec[spec.index(after: eq)...])
-        guard let seconds = Double(secStr), seconds > 0 else {
-            appendSystem("Seconds must be a positive number.")
+        // isFinite matters: Double("inf") parses, and JSONEncoder refuses to
+        // encode a non-finite Double. One `/timer inf=look` would make every
+        // future save in the app fail silently, forever.
+        guard let seconds = Double(secStr), seconds.isFinite, seconds > 0, seconds <= 31_536_000 else {
+            appendSystem("Seconds must be a positive number (up to 31536000).")
             return
         }
         let timer = MudTimer(seconds: seconds, sendText: sendText)

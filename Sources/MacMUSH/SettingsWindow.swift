@@ -219,7 +219,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         sidebarScroll.borderType = .bezelBorder
         sidebarScroll.documentView = worldsTable
 
-        let tabView = NSTabView()
+        // Give the tab view a real starting frame. At zero size, adding the
+        // first item lays its pane out into a zero-height rect, and the pane's
+        // required constraints can't be satisfied for that first solve.
+        let tabView = NSTabView(frame: NSRect(x: 0, y: 0, width: 560, height: 460))
         tabView.addTabViewItem(makeTab("Connection", connectionPane()))
         tabView.addTabViewItem(makeTab("Triggers", rulePane(triggersTable, kind: .trigger)))
         tabView.addTabViewItem(makeTab("Aliases", rulePane(aliasesTable, kind: .alias)))
@@ -380,7 +383,18 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         reloadFromStore()
     }
 
+    /// Force any open field editor to commit before the model underneath it
+    /// changes. Without this, swapping worlds or reloading a table silently
+    /// throws away whatever the user was in the middle of typing — and worse,
+    /// an edit still pending when `editingID` moves would land on the wrong
+    /// world. Ending editing first makes the edit commit against the world and
+    /// row it was actually typed into.
+    private func endEditing() {
+        _ = window.makeFirstResponder(nil)
+    }
+
     private func reloadFromStore() {
+        endEditing()
         worlds = WorldStore.shared.worlds
         if editingID == nil || !worlds.contains(where: { $0.id == editingID }) {
             editingID = WorldStore.shared.selectedWorldID ?? worlds.first?.id
@@ -473,6 +487,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let table = notification.object as? NSTableView, table === worldsTable else { return }
+        // Commit before `editingID` moves, so a half-typed edit belongs to the
+        // world it was typed into rather than the one just clicked.
+        endEditing()
         let row = worldsTable.selectedRow
         guard row >= 0, row < worlds.count else { return }
         guard worlds[row].id != editingID else { return }
@@ -490,6 +507,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         } else {
             field = NSTextField()
             field.identifier = id
+            // A code-created NSTextField is bezeled by default, and clearing
+            // `isBordered` does not clear the bezel — without this every cell
+            // draws as a sunken text box and the table reads as a form grid.
+            field.isBezeled = false
             field.isBordered = false
             field.drawsBackground = false
             field.usesSingleLineMode = true
@@ -701,6 +722,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     // MARK: Add / remove
 
     @objc private func ruleSegment(_ sender: NSSegmentedControl) {
+        // A segmented control doesn't take first responder, so a cell being
+        // edited right now is still open. Commit it before rows shift.
+        endEditing()
         guard let raw = sender.identifier?.rawValue,
               let kind = Kind(rawValue: raw),
               let i = editingIndex else { return }
@@ -742,6 +766,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     }
 
     @objc private func worldSegment(_ sender: NSSegmentedControl) {
+        endEditing()
         if sender.selectedSegment == 0 { addWorld() } else { removeEditingWorld() }
     }
 
@@ -803,6 +828,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     }
 
     @objc private func makeActive() {
+        // Commit first, otherwise the live window adopts a stale copy that is
+        // missing whatever is sitting uncommitted in a text field.
+        endEditing()
         guard let world = editingWorld else { return }
         onActivateWorld?(world)
         updateActiveLabel()

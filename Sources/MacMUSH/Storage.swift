@@ -49,7 +49,12 @@ enum Storage {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(app) else { return }
-        try? data.write(to: appFile)
+        // Atomic: the settings window saves on every field edit and checkbox
+        // toggle, so a crash or force-quit mid-write is no longer a rare event.
+        // A truncated worlds.json fails to decode on launch and the fallback
+        // path would hand back one empty default world — every trigger, alias
+        // and timer gone, silently.
+        try? data.write(to: appFile, options: .atomic)
     }
 }
 #endif
