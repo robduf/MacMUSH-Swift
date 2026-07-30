@@ -42,7 +42,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         let contentSize = scrollView.contentSize
         textView = NSTextView(frame: NSRect(origin: .zero, size: contentSize))
         textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
@@ -51,7 +51,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         textView.drawsBackground = true
         textView.backgroundColor = renderer.background
         textView.textContainerInset = NSSize(width: 8, height: 6)
-        textView.textContainer?.containerSize = NSSize(width: contentSize.width, height: .greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
         scrollView.documentView = textView
 
