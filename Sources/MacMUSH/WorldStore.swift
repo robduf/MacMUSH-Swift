@@ -57,11 +57,29 @@ final class WorldStore {
         commit(c)
     }
 
+    /// Persist edits to a specific world, matched by id. Safer than
+    /// `updateSelectedWorld` for any caller that knows which world it edited —
+    /// it can't scribble over a different world if the selection has moved.
+    func update(_ world: WorldConfig) {
+        var c = config
+        guard c.update(world) else { return }
+        commit(c)
+    }
+
     /// Add a world and make it active. Returns the stored world.
     @discardableResult
     func addWorld(_ world: WorldConfig) -> WorldConfig {
         var c = config
         c.addWorld(world)
+        commit(c)
+        return world
+    }
+
+    /// Add a world without changing which one is active.
+    @discardableResult
+    func insertWorld(_ world: WorldConfig) -> WorldConfig {
+        var c = config
+        c.insertWorld(world)
         commit(c)
         return world
     }

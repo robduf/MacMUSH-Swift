@@ -188,12 +188,15 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         appendSystem("— Switched to \(world.name)  (\(world.host) \(world.port)).  ⌘R to connect. —")
     }
 
-    /// Update the active world's saved metadata in place (e.g. after a rename)
-    /// without disturbing the connection or scrollback.
+    /// Adopt edits to the world this window is already showing — a rename, or a
+    /// change made in the Worlds window — without disturbing the connection or
+    /// scrollback. New triggers and aliases take effect on the next line; timers
+    /// are re-armed below.
     func syncActiveWorld(_ world: WorldConfig) {
         guard world.id == config.id else { return }
         config = world
         window.title = "MacMUSH — \(world.name)"
+        reconcileTimers()
     }
 
     /// Connect using the saved world's host/port.
@@ -338,6 +341,22 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         }
     }
 
+    /// Keep the fire-date table in step with the current timer list after an
+    /// edit: newly enabled timers start counting now, removed or disabled ones
+    /// are forgotten, and timers already counting down keep their place.
+    private func reconcileTimers() {
+        guard isConnected else {
+            timerFireDates.removeAll()
+            return
+        }
+        let now = Date()
+        var live: [String: Date] = [:]
+        for timer in config.timers where timer.enabled {
+            live[timer.id] = timerFireDates[timer.id] ?? now.addingTimeInterval(timer.seconds)
+        }
+        timerFireDates = live
+    }
+
     private func startTicker() {
         tickTimer?.invalidate()
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -372,8 +391,11 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     // MARK: Persistence
 
+    /// Save by id rather than "whichever world is selected": the Worlds window
+    /// can move the selection around while this window stays on its own world,
+    /// and a slash command here must never land in someone else's config.
     private func saveConfig() {
-        WorldStore.shared.updateSelectedWorld(config)
+        WorldStore.shared.update(config)
     }
 
     // MARK: Slash commands

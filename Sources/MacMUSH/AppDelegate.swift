@@ -4,6 +4,7 @@ import MudEngine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var worldWindow: WorldWindow?
+    private var settingsWindow: SettingsWindow?
     private var worldsMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "About MacMUSH",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let settingsItem = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide MacMUSH", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
@@ -113,16 +117,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renameItem.target = self
         let deleteItem = menu.addItem(withTitle: "Delete Current World…", action: #selector(deleteWorld), keyEquivalent: "")
         deleteItem.target = self
+        menu.addItem(.separator())
+        let manageItem = menu.addItem(withTitle: "Manage Worlds…", action: #selector(showSettings), keyEquivalent: "")
+        manageItem.target = self
     }
 
     @objc private func worldStoreChanged() {
         rebuildWorldsMenu()
+        syncLiveWindow()
+    }
+
+    /// Push store changes into the live window: edits made in the Worlds window
+    /// apply in place, and if the world it was showing has been deleted it moves
+    /// to whatever the store selected in its stead.
+    private func syncLiveWindow() {
+        guard let window = worldWindow else { return }
+        let store = WorldStore.shared
+        if let current = store.worlds.first(where: { $0.id == window.currentWorldID }) {
+            window.syncActiveWorld(current)
+        } else {
+            window.activate(world: store.selectedWorld)
+        }
     }
 
     // MARK: Actions
 
     @objc private func connect() { worldWindow?.promptConnect() }
     @objc private func disconnect() { worldWindow?.disconnect() }
+
+    @objc private func showSettings() {
+        if settingsWindow == nil {
+            let settings = SettingsWindow()
+            settings.onActivateWorld = { [weak self] world in
+                WorldStore.shared.select(id: world.id)
+                self?.worldWindow?.activate(world: world)
+            }
+            settingsWindow = settings
+        }
+        settingsWindow?.show()
+    }
 
     @objc private func switchWorld(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }

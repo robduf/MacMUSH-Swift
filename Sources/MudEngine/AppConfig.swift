@@ -72,12 +72,32 @@ public struct AppConfig: Codable, Equatable, Sendable {
         }
     }
 
+    /// Replace any world, matched by id, leaving the selection alone. Returns
+    /// false if no world with that id is present.
+    ///
+    /// Prefer this over `updateSelected` when the caller knows *which* world it
+    /// edited: it can't write one world's changes into another if the active
+    /// selection has moved on in the meantime.
+    @discardableResult
+    public mutating func update(_ world: WorldConfig) -> Bool {
+        guard let i = worlds.firstIndex(where: { $0.id == world.id }) else { return false }
+        worlds[i] = world
+        return true
+    }
+
     /// Add a world and make it active. Returns its id.
     @discardableResult
     public mutating func addWorld(_ world: WorldConfig) -> String {
         worlds.append(world)
         selectedWorldID = world.id
         return world.id
+    }
+
+    /// Add a world *without* changing which one is active — used by the Worlds
+    /// window, where adding an entry shouldn't yank the live session sideways.
+    public mutating func insertWorld(_ world: WorldConfig) {
+        worlds.append(world)
+        normalize()
     }
 
     /// Remove the world with the given id, then re-establish a valid selection.

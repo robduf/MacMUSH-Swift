@@ -55,6 +55,45 @@ final class AppConfigTests: XCTestCase {
         XCTAssertEqual(config.selectedWorldID, b.id)
     }
 
+    func testUpdateReplacesByIDWithoutTouchingSelection() {
+        let a = WorldConfig(name: "Alpha")
+        let b = WorldConfig(name: "Beta")
+        var config = AppConfig(worlds: [a, b], selectedWorldID: b.id)
+
+        // Edit the world that is *not* selected — the whole point of update(_:).
+        var edited = a
+        edited.host = "edited.example.org"
+        edited.triggers.append(MatchRule(pattern: "* waves", sendText: "wave"))
+        XCTAssertTrue(config.update(edited))
+
+        XCTAssertEqual(config.worlds[0].host, "edited.example.org")
+        XCTAssertEqual(config.worlds[0].triggers.count, 1)
+        XCTAssertEqual(config.worlds[1], b)                 // Beta untouched
+        XCTAssertEqual(config.selectedWorldID, b.id)        // selection unmoved
+    }
+
+    func testUpdateIgnoresUnknownWorld() {
+        let a = WorldConfig(name: "Alpha")
+        var config = AppConfig(worlds: [a], selectedWorldID: a.id)
+
+        let stranger = WorldConfig(name: "Ghost")
+        XCTAssertFalse(config.update(stranger))
+        XCTAssertEqual(config.worlds.count, 1)
+        XCTAssertEqual(config.worlds[0], a)
+    }
+
+    func testInsertWorldKeepsSelection() {
+        let a = WorldConfig(name: "Alpha")
+        let b = WorldConfig(name: "Beta")
+        var config = AppConfig(worlds: [a, b], selectedWorldID: b.id)
+
+        config.insertWorld(WorldConfig(name: "Gamma"))
+
+        XCTAssertEqual(config.worlds.count, 3)
+        XCTAssertEqual(config.worlds[2].name, "Gamma")
+        XCTAssertEqual(config.selectedWorldID, b.id)        // still on Beta
+    }
+
     func testAddWorldSelectsIt() {
         let a = WorldConfig(name: "Alpha")
         var config = AppConfig(worlds: [a], selectedWorldID: a.id)
