@@ -41,6 +41,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     private let makeActiveButton = NSButton(title: "Make Active", target: nil, action: nil)
     private let activeLabel = NSTextField(labelWithString: "")
 
+    // Logging — per world, so you can keep a transcript of one MUSH and not another.
+    private let logCheck = NSButton(checkboxWithTitle: "Save a log of every session",
+                                    target: nil, action: nil)
+    private let logPathField = NSTextField()
+    private let logChooseButton = NSButton(title: "Choose…", target: nil, action: nil)
+
     // Rule panes
     private let triggersTable = NSTableView()
     private let aliasesTable = NSTableView()
@@ -99,7 +105,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
     private func configure() {
         window.title = "Worlds"
-        window.minSize = NSSize(width: 700, height: 420)
+        // 480 rather than 420: the Connection pane grew a logging checkbox and a
+        // folder row, and at the old minimum they had barely fifteen points of
+        // slack before Auto Layout started breaking constraints to fit.
+        window.minSize = NSSize(width: 700, height: 480)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
@@ -170,6 +179,27 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
         activeLabel.font = NSFont.systemFont(ofSize: 11)
         activeLabel.textColor = .secondaryLabelColor
+
+        logCheck.target = self
+        logCheck.action = #selector(logCheckToggled)
+
+        // Not routed through `cellEdited`'s Kind switch — that only knows the
+        // three rule tables — so this field carries a "conn." identifier and is
+        // handled by `applyConnectionEdit` like name/host/port.
+        logPathField.identifier = NSUserInterfaceItemIdentifier("conn.logdir")
+        logPathField.placeholderString = "~/Documents/MacMUSH Logs/<world>"
+        logPathField.delegate = self
+        logPathField.target = self
+        logPathField.action = #selector(cellEdited(_:))
+        logPathField.usesSingleLineMode = true
+        logPathField.font = NSFont.systemFont(ofSize: 11)
+        logPathField.toolTip = "Leave empty to use the default folder in Documents."
+
+        logChooseButton.bezelStyle = .rounded
+        logChooseButton.controlSize = .small
+        logChooseButton.font = NSFont.systemFont(ofSize: 11)
+        logChooseButton.target = self
+        logChooseButton.action = #selector(chooseLogFolder)
     }
 
     private func configureRuleTable(_ table: NSTableView, kind: Kind) {
@@ -269,10 +299,17 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
         for view in [nameLabel, hostLabel, portLabel, sendLabel,
                      nameField, hostField, portField, connectScroll,
+                     logCheck, logPathField, logChooseButton,
                      makeActiveButton, activeLabel] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             pane.addSubview(view)
         }
+
+        // The path row must give way before the Choose button does, or a long
+        // folder path pushes the button off the edge of the pane.
+        logPathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        logChooseButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        logChooseButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let labelWidth: CGFloat = 46
 
@@ -306,7 +343,18 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             connectScroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -14),
             connectScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
-            makeActiveButton.topAnchor.constraint(equalTo: connectScroll.bottomAnchor, constant: 12),
+            logCheck.topAnchor.constraint(equalTo: connectScroll.bottomAnchor, constant: 14),
+            logCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            logCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
+
+            // Indented under the checkbox it belongs to.
+            logPathField.topAnchor.constraint(equalTo: logCheck.bottomAnchor, constant: 8),
+            logPathField.leadingAnchor.constraint(equalTo: logCheck.leadingAnchor, constant: 18),
+            logChooseButton.centerYAnchor.constraint(equalTo: logPathField.centerYAnchor),
+            logChooseButton.leadingAnchor.constraint(equalTo: logPathField.trailingAnchor, constant: 8),
+            logChooseButton.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -14),
+
+            makeActiveButton.topAnchor.constraint(equalTo: logPathField.bottomAnchor, constant: 14),
             makeActiveButton.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             makeActiveButton.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -14),
 
@@ -412,6 +460,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         hostField.stringValue = world.host
         portField.stringValue = "\(world.port)"
         connectTextView.string = world.connectText
+        logCheck.state = world.logEnabled ? .on : .off
+        logPathField.stringValue = world.logDirectory
+        updateLogControls()
         updateActiveLabel()
         triggersTable.reloadData()
         aliasesTable.reloadData()
@@ -626,6 +677,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             guard worlds[i].port != port else { return }
             worlds[i].port = port
             commitWorld(at: i)
+        case "logdir":
+            // Empty is meaningful here — it means "use the default folder" — so
+            // unlike host and port there's nothing to reject.
+            guard worlds[i].logDirectory != value else { return }
+            worlds[i].logDirectory = value
+            field.stringValue = value
+            commitWorld(at: i)
         default:
             break
         }
@@ -716,6 +774,58 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         let text = connectTextView.string
         guard worlds[i].connectText != text else { return }
         worlds[i].connectText = text
+        commitWorld(at: i)
+    }
+
+    // MARK: Logging
+
+    /// The path row only means anything when logging is on, so grey it out
+    /// rather than leaving a live-looking field that changes nothing.
+    private func updateLogControls() {
+        let on = logCheck.state == .on
+        logPathField.isEnabled = on
+        logChooseButton.isEnabled = on
+        logPathField.textColor = on ? .labelColor : .disabledControlTextColor
+    }
+
+    @objc private func logCheckToggled() {
+        // A checkbox doesn't take first responder, so a path being typed right
+        // now is still open in its field editor. Commit it before we write.
+        endEditing()
+        updateLogControls()
+        guard let i = editingIndex else { return }
+        let on = logCheck.state == .on
+        guard worlds[i].logEnabled != on else { return }
+        worlds[i].logEnabled = on
+        commitWorld(at: i)
+    }
+
+    @objc private func chooseLogFolder() {
+        endEditing()
+        guard let world = editingWorld else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Where should logs for “\(world.name)” be saved?"
+        let existing = world.logDirectory.trimmingCharacters(in: .whitespaces)
+        if !existing.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (existing as NSString).expandingTildeInPath,
+                                     isDirectory: true)
+        }
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // The modal ran its own run loop, so the store may have changed under us
+        // — re-resolve rather than trusting an index captured before the panel.
+        guard let i = editingIndex else { return }
+        let path = url.path
+        logPathField.stringValue = path
+        guard worlds[i].logDirectory != path else { return }
+        worlds[i].logDirectory = path
         commitWorld(at: i)
     }
 

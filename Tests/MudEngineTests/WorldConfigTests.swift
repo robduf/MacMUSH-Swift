@@ -9,6 +9,8 @@ final class WorldConfigTests: XCTestCase {
         config.triggers.append(MatchRule(pattern: "* tells you *", sendText: "wave", gag: true))
         config.timers.append(MudTimer(seconds: 60, sendText: "look"))
         config.connectText = "connect Char pass"
+        config.logEnabled = true
+        config.logDirectory = "/Users/somebody/Logs"
 
         let data = try JSONEncoder().encode(config)
         let decoded = try JSONDecoder().decode(WorldConfig.self, from: data)
@@ -18,6 +20,22 @@ final class WorldConfigTests: XCTestCase {
         XCTAssertEqual(decoded.aliases.count, 1)
         XCTAssertEqual(decoded.triggers.first?.gag, true)
         XCTAssertEqual(decoded.timers.first?.seconds, 60)
+        XCTAssertTrue(decoded.logEnabled)
+        XCTAssertEqual(decoded.logDirectory, "/Users/somebody/Logs")
+    }
+
+    /// Logging off with a folder still remembered: turning the checkbox back on
+    /// must not have lost where the user had pointed it.
+    func testLogDirectorySurvivesLoggingBeingOff() throws {
+        var config = WorldConfig(name: "Shang")
+        config.logEnabled = false
+        config.logDirectory = "~/Documents/Shang"
+
+        let decoded = try JSONDecoder().decode(
+            WorldConfig.self, from: try JSONEncoder().encode(config))
+
+        XCTAssertFalse(decoded.logEnabled)
+        XCTAssertEqual(decoded.logDirectory, "~/Documents/Shang")
     }
 
     func testDefaults() {
@@ -50,5 +68,10 @@ final class WorldConfigTests: XCTestCase {
         XCTAssertTrue(decoded.triggers.isEmpty)     // defaulted
         XCTAssertTrue(decoded.aliases.isEmpty)
         XCTAssertTrue(decoded.timers.isEmpty)
+
+        // Logging arrived after this JSON was written: it must default to off,
+        // not start silently recording a world the user never opted in for.
+        XCTAssertFalse(decoded.logEnabled)
+        XCTAssertEqual(decoded.logDirectory, "")
     }
 }

@@ -16,6 +16,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
     public var triggers: [MatchRule]
     public var aliases: [MatchRule]
     public var timers: [MudTimer]
+    public var logEnabled: Bool            // write a session log while connected
+    public var logDirectory: String        // "" means the per-world default folder
 
     public init(id: String = UUID().uuidString,
                 name: String = "My World",
@@ -24,7 +26,9 @@ public struct WorldConfig: Codable, Equatable, Sendable {
                 connectText: String = "",
                 triggers: [MatchRule] = [],
                 aliases: [MatchRule] = [],
-                timers: [MudTimer] = []) {
+                timers: [MudTimer] = [],
+                logEnabled: Bool = false,
+                logDirectory: String = "") {
         self.id = id
         self.name = name
         self.host = host
@@ -33,10 +37,13 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.triggers = triggers
         self.aliases = aliases
         self.timers = timers
+        self.logEnabled = logEnabled
+        self.logDirectory = logDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, host, port, connectText, triggers, aliases, timers
+        case logEnabled, logDirectory
     }
 
     public init(from decoder: Decoder) throws {
@@ -49,6 +56,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.triggers = try c.decodeIfPresent([MatchRule].self, forKey: .triggers) ?? []
         self.aliases = try c.decodeIfPresent([MatchRule].self, forKey: .aliases) ?? []
         self.timers = try c.decodeIfPresent([MudTimer].self, forKey: .timers) ?? []
+        self.logEnabled = try c.decodeIfPresent(Bool.self, forKey: .logEnabled) ?? false
+        self.logDirectory = try c.decodeIfPresent(String.self, forKey: .logDirectory) ?? ""
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -61,5 +70,7 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         try c.encode(triggers, forKey: .triggers)
         try c.encode(aliases, forKey: .aliases)
         try c.encode(timers, forKey: .timers)
+        try c.encode(logEnabled, forKey: .logEnabled)
+        try c.encode(logDirectory, forKey: .logDirectory)
     }
 }

@@ -4,26 +4,41 @@ import MudEngine
 
 /// One MUD window: scrollback text view, command input, status line, and the
 /// connection wiring. Code-only AppKit — no storyboards.
-final class WorldWindow: NSObject, NSTextFieldDelegate {
+///
+/// Output and input are the two halves of an `NSSplitView`, so the command box
+/// can be dragged to whatever height suits the pose you're writing, and it word
+/// wraps instead of scrolling sideways off the end of the world.
+final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     private let window: NSWindow
+    private let splitView = NSSplitView()
     private let scrollView = NSScrollView()
     private let textView: NSTextView
-    private let input = NSTextField()
+
+    private let inputPane = NSView()
+    private let inputScroll = NSScrollView()
+    private let inputView: NSTextView
+    private let promptLabel = NSTextField(labelWithString: "›")
+
     private let statusLabel = NSTextField(labelWithString: "Not connected")
+    private let logBadge = NSTextField(labelWithString: "LOG")
+    private let elapsedLabel = NSTextField(labelWithString: "")
 
     private let renderer = AnsiRenderer()
     private var ansi = AnsiParser()
     private var connection: MudConnection?
+    private let logger = SessionLogger()
 
     private var config = WorldStore.shared.selectedWorld
     private var isConnected = false
     private var currentHost = ""
     private var currentPort: UInt16 = 0
+    private var connectedAt: Date?
 
     private var history: [String] = []
     private var historyIndex = -1
     private var draft = ""
     private var echoOn = true
+    private var warnedNotConnected = false
 
     // Incoming lines are assembled here so triggers can match a whole line.
     private var pendingOps: [AnsiOp] = []
@@ -66,53 +81,202 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         textView.textContainer?.widthTracksTextView = true
         scrollView.documentView = textView
 
-        // --- input + status ---
-        input.placeholderString = "Type a command…"
-        input.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        input.focusRingType = .none
-        input.bezelStyle = .roundedBezel
+        // --- input: a real text view, so it wraps and can be resized ---
+        inputScroll.hasVerticalScroller = true
+        inputScroll.autohidesScrollers = true
+        inputScroll.borderType = .noBorder
+        inputScroll.drawsBackground = true
+        inputScroll.backgroundColor = renderer.background
 
+        let inputSize = NSSize(width: 860, height: 64)
+        inputView = NSTextView(frame: NSRect(origin: .zero, size: inputSize))
+        inputView.minSize = NSSize(width: 0, height: 0)
+        inputView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                   height: CGFloat.greatestFiniteMagnitude)
+        inputView.isVerticallyResizable = true
+        inputView.isHorizontallyResizable = false
+        inputView.autoresizingMask = [.width]
+        inputView.isRichText = false
+        inputView.allowsUndo = true
+        inputView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        inputView.drawsBackground = true
+        inputView.backgroundColor = renderer.background
+        inputView.textColor = renderer.defaultForeground
+        inputView.insertionPointColor = renderer.defaultForeground
+        inputView.textContainerInset = NSSize(width: 2, height: 4)
+        inputView.textContainer?.containerSize = NSSize(width: inputSize.width,
+                                                        height: CGFloat.greatestFiniteMagnitude)
+        inputView.textContainer?.widthTracksTextView = true
+        // macOS "helpfully" turns "don't" into "don’t" and -- into an em dash.
+        // A MUSH takes those literally, so `page bob="don't"` would go out with
+        // a curly quote the server has never heard of.
+        inputView.isAutomaticQuoteSubstitutionEnabled = false
+        inputView.isAutomaticDashSubstitutionEnabled = false
+        inputView.isAutomaticTextReplacementEnabled = false
+        inputView.isAutomaticSpellingCorrectionEnabled = false
+        inputScroll.documentView = inputView
+
+        promptLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+        promptLabel.textColor = .tertiaryLabelColor
+
+        // --- status bar ---
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
+        logBadge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        logBadge.textColor = .systemGreen
+        logBadge.isHidden = true
+
+        // Monospaced digits, or the timer jitters a pixel every second as the
+        // glyph widths change under it.
+        elapsedLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        elapsedLabel.textColor = .secondaryLabelColor
+
         super.init()
 
-        input.delegate = self
-        input.target = self
-        input.action = #selector(sendFromInput)
+        inputView.delegate = self
+        splitView.delegate = self
 
         layout()
+
+        // An NSTextView sizes itself to its text, so with a minimum height of
+        // zero the blank space under a one-line command isn't part of the view
+        // at all and clicking there does nothing. Keep the minimum matched to
+        // whatever is visible, which changes every time the divider moves.
+        inputScroll.contentView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(inputClipResized(_:)),
+            name: NSView.frameDidChangeNotification, object: inputScroll.contentView)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        // The run loop holds the ticker, not this object. Weak capture keeps it
+        // from crashing, but without this it goes on waking once a second
+        // forever after the window is gone.
+        stopTicker()
     }
 
     private func layout() {
         let content = NSView()
-        for v in [scrollView, input, statusLabel] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(v)
+
+        buildInputPane()
+
+        // NSSplitView positions its subviews itself, so those keep their
+        // autoresizing masks — only the split view is constraint-driven. The
+        // starting frames below decide the first-run proportions; after that,
+        // `autosaveName` restores wherever the user left the divider.
+        splitView.isVertical = false
+        splitView.dividerStyle = .thin
+        scrollView.frame = NSRect(x: 0, y: 0, width: 884, height: 452)
+        inputPane.frame = NSRect(x: 0, y: 0, width: 884, height: 76)
+        splitView.addSubview(scrollView)
+        splitView.addSubview(inputPane)
+        // Set last: a saved divider position needs subviews to restore onto.
+        splitView.autosaveName = "MacMUSH.outputInputSplit"
+
+        for view in [splitView, statusLabel, logBadge, elapsedLabel] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
         }
+
+        // A long host name shouldn't shove the timer off the right edge — let
+        // the status text truncate and keep the readouts pinned.
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for label in [logBadge, elapsedLabel] {
+            label.setContentCompressionResistancePriority(.required, for: .horizontal)
+            label.setContentHuggingPriority(.required, for: .horizontal)
+        }
+        // The clock is empty until you connect. Its width is reserved below so
+        // the LOG badge doesn't slide sideways the moment it starts ticking —
+        // which means hugging has to yield to that reservation rather than
+        // fight it and log a broken-constraint warning.
+        elapsedLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(999), for: .horizontal)
+
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
-            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
+            splitView.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
+            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
 
-            input.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 6),
-            input.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
-            input.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
-
-            statusLabel.topAnchor.constraint(equalTo: input.bottomAnchor, constant: 6),
+            statusLabel.topAnchor.constraint(equalTo: splitView.bottomAnchor, constant: 6),
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
             statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
+
+            logBadge.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            logBadge.leadingAnchor.constraint(greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 8),
+
+            elapsedLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            elapsedLabel.leadingAnchor.constraint(equalTo: logBadge.trailingAnchor, constant: 8),
+            elapsedLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            elapsedLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
         ])
         window.contentView = content
         window.center()
     }
 
+    /// The bottom half of the split: a "›" prompt beside the wrapping command
+    /// box. The pane itself is frame-driven (the split view owns it); the two
+    /// things inside it use constraints as usual.
+    private func buildInputPane() {
+        for view in [promptLabel, inputScroll] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            inputPane.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            promptLabel.topAnchor.constraint(equalTo: inputPane.topAnchor, constant: 6),
+            promptLabel.leadingAnchor.constraint(equalTo: inputPane.leadingAnchor, constant: 6),
+
+            inputScroll.topAnchor.constraint(equalTo: inputPane.topAnchor, constant: 2),
+            inputScroll.leadingAnchor.constraint(equalTo: promptLabel.trailingAnchor, constant: 4),
+            inputScroll.trailingAnchor.constraint(equalTo: inputPane.trailingAnchor, constant: -2),
+            inputScroll.bottomAnchor.constraint(equalTo: inputPane.bottomAnchor, constant: -2),
+        ])
+    }
+
+    // MARK: Split view
+
+    /// Window resizing grows and shrinks the scrollback; the command box keeps
+    /// whatever height it was dragged to.
+    func splitView(_ splitView: NSSplitView, shouldAdjustSizeOfSubview view: NSView) -> Bool {
+        view === scrollView
+    }
+
+    func splitView(_ splitView: NSSplitView,
+                   constrainMinCoordinate proposedMinimumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        max(proposedMinimumPosition, 120)
+    }
+
+    func splitView(_ splitView: NSSplitView,
+                   constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        // Always leave room for at least one line of input plus its insets,
+        // otherwise the box can be collapsed to nothing and there's no obvious
+        // way to get it back.
+        let floor = splitView.bounds.height - splitView.dividerThickness - 34
+        return min(proposedMaximumPosition, max(120, floor))
+    }
+
+    @objc private func inputClipResized(_ note: Notification) {
+        syncInputMinHeight()
+    }
+
+    /// Make the whole command box a click target rather than only the lines
+    /// that happen to have text on them.
+    private func syncInputMinHeight() {
+        let visible = inputScroll.contentView.bounds.height
+        guard visible > 1, inputView.minSize.height != visible else { return }
+        inputView.minSize = NSSize(width: 0, height: visible)
+        inputView.sizeToFit()
+    }
+
     func showWindow() {
         window.title = "MacMUSH — \(config.name)"
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(input)
+        syncInputMinHeight()
+        _ = window.makeFirstResponder(inputView)
+        updateStatus()
         showWelcome()
     }
 
@@ -135,26 +299,34 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         ansi.resetStyle()
         pendingOps = []
         pendingPlain = ""
+        warnedNotConnected = false
         appendSystem("Connecting to \(host):\(port)…")
 
         let conn = MudConnection(host: host, port: port)
         conn.onText = { [weak self] text in self?.render(text) }
         conn.onPrompt = { [weak self] in self?.flushLine(isPrompt: true) }
         conn.onEcho = { [weak self] on in self?.setEcho(on) }
+        conn.onNotice = { [weak self] message in self?.appendSystem(message) }
         conn.onStateChange = { [weak self] connected, message in
             guard let self = self else { return }
             self.isConnected = connected
             if connected {
-                self.statusLabel.stringValue = "Connected to \(self.currentHost):\(self.currentPort)"
+                self.connectedAt = Date()
+                // Open the log before the first line is printed, so "Connected."
+                // and everything the MUD greets you with lands in the file.
+                self.startLoggingIfEnabled()
+                self.updateStatus()
                 self.appendSystem("Connected.")
                 self.sendConnectText()
                 self.armTimers()
                 self.startTicker()
             } else {
-                self.statusLabel.stringValue = "Not connected"
                 if let message = message { self.appendSystem(message) }
+                self.connectedAt = nil
                 self.setEcho(true)
                 self.stopTicker()
+                self.stopLogging()
+                self.updateStatus()
             }
         }
         conn.start()
@@ -165,7 +337,18 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         connection?.disconnect()
         connection = nil
         isConnected = false
+        connectedAt = nil
+        // Dropping the connection deallocates the object whose callback would
+        // otherwise have turned echo back on, so do it here. Otherwise a
+        // disconnect during a password prompt leaves every line of the *next*
+        // session missing from the scrollback and the log.
+        setEcho(true)
         stopTicker()
+        stopLogging()
+        // The next thing typed deserves its own "Not connected." — the warning
+        // is once per batch, not once per lifetime of the window.
+        warnedNotConnected = false
+        updateStatus()
     }
 
     /// The world this window is currently bound to.
@@ -183,8 +366,8 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         pendingPlain = ""
         timerFireDates.removeAll()
         setEcho(true)
-        statusLabel.stringValue = "Not connected"
         window.title = "MacMUSH — \(world.name)"
+        updateStatus()
         appendSystem("— Switched to \(world.name)  (\(world.host) \(world.port)).  ⌘R to connect. —")
     }
 
@@ -194,9 +377,38 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     /// are re-armed below.
     func syncActiveWorld(_ world: WorldConfig) {
         guard world.id == config.id else { return }
+        let oldDirectory = config.logDirectory
+        let wasEnabled = config.logEnabled
         config = world
         window.title = "MacMUSH — \(world.name)"
         reconcileTimers()
+
+        // Ticking the logging box takes effect on the session you're sitting in
+        // rather than the next one. Keyed off the box *changing*, not off the
+        // logger being inactive: this method also runs on every /alias, every
+        // /timer and every one-shot timer expiry, so a retry-while-inactive
+        // would re-attempt a failing folder — and print its error — over and
+        // over for the rest of the evening. Untick and re-tick to retry.
+        //
+        // Changing the *folder* deliberately doesn't apply until you reconnect.
+        // Honouring it live would roll the log file, and create a directory, for
+        // every half-finished path on the way to the real one.
+        if isConnected {
+            if !config.logEnabled {
+                stopLogging()
+            } else if !wasEnabled {
+                startLoggingIfEnabled()
+            } else if oldDirectory != config.logDirectory {
+                // Two different truths: if a log is running, the new folder is
+                // simply queued for next time. If one *isn't* — the last start
+                // failed — then saying "next time you connect" reads as though
+                // something is being kept, when nothing is.
+                appendSystem(logger.isActive
+                    ? "Log folder changed — it takes effect next time you connect."
+                    : "Log folder changed — untick and re-tick logging to start writing there now.")
+            }
+        }
+        updateStatus()
     }
 
     /// Connect using the saved world's host/port.
@@ -267,6 +479,9 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         if !gagged {
             renderer.append(lineOps + [.newline], to: textView)
             textView.scrollToEndOfDocument(nil)
+            // A gagged line stays out of the log too — if a trigger hid it from
+            // you, writing it to disk anyway would be a nasty surprise.
+            logLine(plain)
         }
     }
 
@@ -276,20 +491,90 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         let color = NSColor(srgbRed: 0.53, green: 0.53, blue: 0.80, alpha: 1)
         textView.textStorage?.append(renderer.systemLine(message + "\n", color: color))
         textView.scrollToEndOfDocument(nil)
+        logLine(message)
     }
 
     private func appendEcho(_ line: String) {
+        // A MUSH login carries the password on the same line as the character
+        // name, and most servers never negotiate telnet ECHO to hide it. Mask
+        // it here, which is the one funnel every echoed line passes through, so
+        // it reaches neither the scrollback nor the log. What you typed is
+        // still in the history buffer, so ↑ brings the real line back.
+        let shown = "› " + SessionFormat.redactLogin(line)
         let color = NSColor(srgbRed: 0.91, green: 0.82, blue: 0.38, alpha: 1)
-        textView.textStorage?.append(renderer.systemLine("› " + line + "\n", color: color))
+        textView.textStorage?.append(renderer.systemLine(shown + "\n", color: color))
         textView.scrollToEndOfDocument(nil)
+        logLine(shown)
+    }
+
+    // MARK: Status bar
+
+    private func updateStatus() {
+        statusLabel.stringValue = isConnected
+            ? "\(config.name)  |  \(currentHost):\(currentPort)"
+            : "Not connected"
+        logBadge.isHidden = !logger.isActive
+        logBadge.toolTip = logger.fileURL?.path
+        updateElapsed()
+    }
+
+    private func updateElapsed() {
+        guard let start = connectedAt else {
+            if !elapsedLabel.stringValue.isEmpty { elapsedLabel.stringValue = "" }
+            return
+        }
+        let text = SessionFormat.elapsed(Date().timeIntervalSince(start))
+        // Only touch the label when the second actually rolls over; assigning
+        // stringValue redraws, and this runs every tick forever.
+        if elapsedLabel.stringValue != text { elapsedLabel.stringValue = text }
+    }
+
+    // MARK: Logging
+
+    private func startLoggingIfEnabled() {
+        guard config.logEnabled else { return }
+        if let problem = logger.start(worldName: config.name,
+                                      host: currentHost,
+                                      port: currentPort,
+                                      directory: config.logDirectory) {
+            appendSystem(problem)
+            return
+        }
+        if let url = logger.fileURL { appendSystem("Logging to \(url.path)") }
+    }
+
+    private func stopLogging() {
+        guard logger.isActive else { return }
+        let url = logger.fileURL
+        logger.stop()
+        if let url = url { appendSystem("Log saved: \(url.path)") }
+    }
+
+    /// Mirror one displayed line into the session log. Safe to call from the
+    /// append helpers: a failed write closes the logger *before* returning the
+    /// warning, so the `appendSystem` below can't recurse back in here.
+    private func logLine(_ text: String) {
+        guard logger.isActive else { return }
+        guard let problem = logger.write(text) else { return }
+        appendSystem(problem)
+        updateStatus()
     }
 
     // MARK: Sending
 
     /// Send one or more lines to the MUD (multi-line text is split on "\n").
     private func send(_ text: String, echo: Bool) {
-        guard connection != nil else {
-            appendSystem("Not connected.")
+        // `isConnected` as well as the object: when the *server* closes the
+        // link, `connection` stays non-nil — only `disconnect()` clears it — so
+        // checking the object alone would swallow the line and still echo it to
+        // the screen as though it had gone out.
+        guard isConnected, connection != nil else {
+            // Paste twenty lines while disconnected and you want to be told
+            // once, not twenty times.
+            if !warnedNotConnected {
+                warnedNotConnected = true
+                appendSystem("Not connected.")
+            }
             return
         }
         for line in text.components(separatedBy: "\n") {
@@ -301,8 +586,11 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     // MARK: Input
 
     @objc private func sendFromInput() {
-        let raw = input.stringValue
-        input.stringValue = ""
+        let raw = inputView.string
+        setInputText("")
+
+        // The whole block goes into history as one entry, so ↑ brings back the
+        // pose you just sent rather than only its last line.
         if !raw.isEmpty && history.last != raw {
             history.append(raw)
             if history.count > 200 { history.removeFirst() }
@@ -310,25 +598,98 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         historyIndex = -1
         draft = ""
 
-        if raw.hasPrefix("/") {
-            handleCommand(raw)
+        // Slash commands still work while disconnected, so the block can't be
+        // rejected up front — `send` warns once for the whole batch instead.
+        warnedNotConnected = false
+        for line in raw.components(separatedBy: "\n") { submit(line) }
+    }
+
+    /// Replace everything in the command box without corrupting undo.
+    ///
+    /// Assigning `inputView.string` goes behind the text system's back: the
+    /// undo manager keeps the ranges it recorded while you were typing, and
+    /// replaying one of those against the now-empty storage raises
+    /// NSRangeException — ⌘Z twice after sending a line would kill the app.
+    /// Bracketing the edit the documented way re-points undo at what's there.
+    private func setInputText(_ text: String) {
+        let all = NSRange(location: 0, length: (inputView.string as NSString).length)
+        guard inputView.shouldChangeText(in: all, replacementString: text) else { return }
+        inputView.textStorage?.replaceCharacters(in: all, with: text)
+        // A storage-level replace doesn't pick up typing attributes, so a
+        // recalled line would otherwise come back in the system font.
+        if !text.isEmpty {
+            inputView.textStorage?.setAttributes(
+                inputView.typingAttributes,
+                range: NSRange(location: 0, length: (text as NSString).length))
+        }
+        inputView.didChangeText()
+    }
+
+    /// One line of what the user typed: a slash command, an alias, or plain text
+    /// straight to the MUD.
+    private func submit(_ line: String) {
+        if line.hasPrefix("/") {
+            handleCommand(line)
             return
         }
 
-        let result = Matcher.evaluate(config.aliases, line: raw)
+        let result = Matcher.evaluate(config.aliases, line: line)
         if result.matches.isEmpty {
-            send(raw, echo: true)
+            send(line, echo: true)
         } else {
-            if echoOn { appendEcho(raw) }
+            if echoOn { appendEcho(line) }
             for match in result.matches where !match.sendText.isEmpty {
                 send(match.sendText, echo: false)
             }
         }
     }
 
+    /// The MUD asked us to stop echoing — it's collecting a password. The typed
+    /// text isn't masked (you still need to see your own typos), but nothing is
+    /// echoed to the scrollback, which also keeps it out of the session log.
     private func setEcho(_ on: Bool) {
         echoOn = on
-        input.placeholderString = on ? "Type a command…" : "Password (hidden)…"
+        promptLabel.stringValue = on ? "›" : "•"
+        promptLabel.textColor = on ? .tertiaryLabelColor : .systemOrange
+        promptLabel.toolTip = on ? nil : "Password mode — this line won't be echoed or logged."
+    }
+
+    // MARK: Key handling in the command box
+
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard textView === inputView else { return false }
+
+        switch commandSelector {
+        case #selector(NSResponder.insertNewline(_:)):
+            sendFromInput()
+            return true
+
+        case #selector(NSResponder.insertLineBreak(_:)),
+             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            // Shift-Return and Option-Return. AppKit's own insertLineBreak puts
+            // in U+2028, which would go down the socket as a stray character —
+            // insert a real newline instead.
+            textView.insertText("\n", replacementRange: textView.selectedRange)
+            return true
+
+        case #selector(NSResponder.moveUp(_:)):
+            // Only walk history from the top line, so the arrows still move the
+            // caret normally inside a multi-line pose.
+            guard caretOnFirstLine else { return false }
+            recallHistory(delta: -1)
+            return true
+
+        case #selector(NSResponder.moveDown(_:)):
+            // Nothing below the line you're still writing, so hand ↓ back to
+            // AppKit rather than swallowing it — the caret should still move to
+            // the end of the text the way it does in every other text view.
+            guard caretOnLastLine, historyIndex != -1 else { return false }
+            recallHistory(delta: 1)
+            return true
+
+        default:
+            return false
+        }
     }
 
     // MARK: Timers
@@ -359,9 +720,14 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     private func startTicker() {
         tickTimer?.invalidate()
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        // .common, not the default mode: otherwise the connected-time clock
+        // freezes — and every world timer stops firing — for as long as a menu
+        // is held open, a panel is up, or the window is being live-resized.
+        RunLoop.main.add(timer, forMode: .common)
+        tickTimer = timer
     }
 
     private func stopTicker() {
@@ -371,6 +737,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     private func tick() {
         guard isConnected else { return }
+        updateElapsed()
         let now = Date()
         var changed = false
         for timer in config.timers where timer.enabled {
@@ -452,7 +819,10 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         let rule = MatchRule(pattern: pattern, sendText: sendText)
         if kind == .alias { config.aliases.append(rule) } else { config.triggers.append(rule) }
         saveConfig()
-        appendSystem("Added \(kind == .alias ? "alias" : "trigger"): \(pattern)  →  \(sendText)")
+        // Redacted for the same reason a typed login is: `/alias in=connect Rob
+        // hunter2` is a perfectly ordinary thing to set up, and echoing it back
+        // verbatim would write the password straight into the session log.
+        appendSystem("Added \(kind == .alias ? "alias" : "trigger"): \(pattern)  →  \(SessionFormat.redactBlock(sendText))")
     }
 
     private func addTimer(_ spec: String) {
@@ -473,7 +843,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         config.timers.append(timer)
         if isConnected { timerFireDates[timer.id] = Date().addingTimeInterval(seconds) }
         saveConfig()
-        appendSystem("Added timer: every \(secStr)s  →  \(sendText)")
+        appendSystem("Added timer: every \(secStr)s  →  \(SessionFormat.redactBlock(sendText))")
     }
 
     private func listRules(_ rules: [MatchRule], label: String) {
@@ -481,7 +851,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         appendSystem("\(label):")
         for (i, r) in rules.enumerated() {
             let flags = (r.enabled ? "" : " [off]") + (r.gag ? " [gag]" : "") + (r.isRegex ? " [regex]" : "")
-            appendSystem("  \(i + 1). \(r.pattern)  →  \(r.sendText)\(flags)")
+            appendSystem("  \(i + 1). \(r.pattern)  →  \(SessionFormat.redactBlock(r.sendText))\(flags)")
         }
     }
 
@@ -490,7 +860,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         appendSystem("Timers:")
         for (i, t) in config.timers.enumerated() {
             let flags = (t.enabled ? "" : " [off]") + (t.oneShot ? " [once]" : "")
-            appendSystem("  \(i + 1). every \(t.seconds)s  →  \(t.sendText)\(flags)")
+            appendSystem("  \(i + 1). every \(t.seconds)s  →  \(SessionFormat.redactBlock(t.sendText))\(flags)")
         }
     }
 
@@ -537,32 +907,52 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     // MARK: History (arrow keys)
 
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        if commandSelector == #selector(NSResponder.moveUp(_:)) {
-            recallHistory(delta: -1)
-            return true
-        }
-        if commandSelector == #selector(NSResponder.moveDown(_:)) {
-            recallHistory(delta: 1)
-            return true
-        }
-        return false
+    /// True when there is no newline anywhere before the caret — i.e. pressing ↑
+    /// would leave the box entirely. Only then does ↑ mean "previous command";
+    /// inside a multi-line pose it has to keep meaning "up one line".
+    private var caretOnFirstLine: Bool {
+        let text = inputView.string as NSString
+        let caret = inputView.selectedRange.location
+        guard caret != NSNotFound, caret <= text.length else { return true }
+        return text.range(of: "\n", options: .backwards,
+                          range: NSRange(location: 0, length: caret)).location == NSNotFound
+    }
+
+    private var caretOnLastLine: Bool {
+        let text = inputView.string as NSString
+        let end = NSMaxRange(inputView.selectedRange)
+        guard end <= text.length else { return true }
+        return text.range(of: "\n", range: NSRange(location: end,
+                                                   length: text.length - end)).location == NSNotFound
     }
 
     private func recallHistory(delta: Int) {
         guard !history.isEmpty else { return }
+        // ↓ from a line you're still writing has nowhere further down to go.
+        // Without this it would stash the draft, come straight back to it, and
+        // yank the caret to the end of what you were in the middle of typing.
+        guard delta < 0 || historyIndex != -1 else { return }
+
         if historyIndex == -1 {
-            draft = input.stringValue
+            // Stash whatever was half-typed so walking back down returns it.
+            draft = inputView.string
             historyIndex = history.count
         }
         historyIndex = max(0, min(history.count, historyIndex + delta))
+
+        let text: String
         if historyIndex >= history.count {
             historyIndex = -1
-            input.stringValue = draft
+            text = draft
         } else {
-            input.stringValue = history[historyIndex]
+            text = history[historyIndex]
         }
-        input.currentEditor()?.selectedRange = NSRange(location: input.stringValue.count, length: 0)
+        setInputText(text)
+        // Caret to the very end: for a multi-line entry that also means the next
+        // ↑ walks up through the recalled text before reaching further back.
+        let end = NSRange(location: (text as NSString).length, length: 0)
+        inputView.selectedRange = end
+        inputView.scrollRangeToVisible(end)
     }
 }
 #endif

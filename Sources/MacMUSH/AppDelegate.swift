@@ -29,6 +29,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// Quitting mid-session still closes the log properly — footer written, file
+    /// handle released — and shuts the socket instead of leaving the MUD to time
+    /// the connection out on its own.
+    func applicationWillTerminate(_ notification: Notification) {
+        worldWindow?.disconnect()
+    }
+
     // MARK: Menu
 
     private func buildMenu() {
