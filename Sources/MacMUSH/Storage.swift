@@ -2,7 +2,9 @@
 import Foundation
 import MudEngine
 
-/// Loads and saves the world config as JSON under Application Support/MacMUSH.
+/// Loads and saves the app config (all worlds + selection) as JSON under
+/// Application Support/MacMUSH. Migrates a single legacy `world.json` — written
+/// by the pre-multi-world version — into the new `worlds.json` on first load.
 enum Storage {
     static var directory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -12,23 +14,42 @@ enum Storage {
         return dir
     }
 
-    static var worldFile: URL {
+    static var appFile: URL {
+        directory.appendingPathComponent("worlds.json")
+    }
+
+    static var legacyWorldFile: URL {
         directory.appendingPathComponent("world.json")
     }
 
-    static func loadWorld() -> WorldConfig {
-        guard let data = try? Data(contentsOf: worldFile),
-              let config = try? JSONDecoder().decode(WorldConfig.self, from: data) else {
-            return WorldConfig()
+    /// Load the full app config. Order: new worlds.json, then a one-time
+    /// migration of a legacy single world.json, then a fresh default. The
+    /// result is always normalized (at least one world, a valid selection).
+    static func loadApp() -> AppConfig {
+        if let data = try? Data(contentsOf: appFile),
+           var app = try? JSONDecoder().decode(AppConfig.self, from: data) {
+            app.normalize()
+            return app
         }
-        return config
+
+        if let data = try? Data(contentsOf: legacyWorldFile),
+           let world = try? JSONDecoder().decode(WorldConfig.self, from: data) {
+            var app = AppConfig(worlds: [world], selectedWorldID: world.id)
+            app.normalize()
+            saveApp(app)                 // write the new format immediately
+            return app
+        }
+
+        var app = AppConfig()
+        app.normalize()
+        return app
     }
 
-    static func saveWorld(_ config: WorldConfig) {
+    static func saveApp(_ app: AppConfig) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(config) else { return }
-        try? data.write(to: worldFile)
+        guard let data = try? encoder.encode(app) else { return }
+        try? data.write(to: appFile)
     }
 }
 #endif

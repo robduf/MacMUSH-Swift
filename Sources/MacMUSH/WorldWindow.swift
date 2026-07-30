@@ -15,7 +15,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     private var ansi = AnsiParser()
     private var connection: MudConnection?
 
-    private var config = Storage.loadWorld()
+    private var config = WorldStore.shared.selectedWorld
     private var isConnected = false
     private var currentHost = ""
     private var currentPort: UInt16 = 0
@@ -110,6 +110,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     }
 
     func showWindow() {
+        window.title = "MacMUSH — \(config.name)"
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(input)
         showWelcome()
@@ -117,8 +118,8 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
 
     private func showWelcome() {
         appendSystem("MacMUSH — a native Swift MUD client.")
-        appendSystem("Press ⌘R to connect (saved: \(config.host) \(config.port)).")
-        appendSystem("Type /help for triggers, aliases and timers. They're saved between sessions.")
+        appendSystem("World: \(config.name)  —  ⌘R to connect (\(config.host) \(config.port)). Switch or add worlds in the Worlds menu.")
+        appendSystem("Type /help for triggers, aliases and timers. They're saved per world, between sessions.")
         appendSystem("Test target:  node scripts/fake-mud.js  →  connect to 127.0.0.1 4000.\n")
     }
 
@@ -165,6 +166,34 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
         connection = nil
         isConnected = false
         stopTicker()
+    }
+
+    /// The world this window is currently bound to.
+    var currentWorldID: String { config.id }
+
+    /// Switch the live window to a different saved world. Drops any current
+    /// connection; the new world connects on the next ⌘R / /connect.
+    func activate(world: WorldConfig) {
+        if isConnected || connection != nil {
+            disconnect()
+        }
+        config = world
+        ansi.resetStyle()
+        pendingOps = []
+        pendingPlain = ""
+        timerFireDates.removeAll()
+        setEcho(true)
+        statusLabel.stringValue = "Not connected"
+        window.title = "MacMUSH — \(world.name)"
+        appendSystem("— Switched to \(world.name)  (\(world.host) \(world.port)).  ⌘R to connect. —")
+    }
+
+    /// Update the active world's saved metadata in place (e.g. after a rename)
+    /// without disturbing the connection or scrollback.
+    func syncActiveWorld(_ world: WorldConfig) {
+        guard world.id == config.id else { return }
+        config = world
+        window.title = "MacMUSH — \(world.name)"
     }
 
     /// Connect using the saved world's host/port.
@@ -344,7 +373,7 @@ final class WorldWindow: NSObject, NSTextFieldDelegate {
     // MARK: Persistence
 
     private func saveConfig() {
-        Storage.saveWorld(config)
+        WorldStore.shared.updateSelectedWorld(config)
     }
 
     // MARK: Slash commands
