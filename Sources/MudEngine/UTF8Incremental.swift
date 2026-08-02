@@ -4,12 +4,18 @@
 
 import Foundation
 
-struct UTF8Incremental {
+// Public so the test executable can exercise it directly. It's a self-contained
+// utility with no ties to the rest of the engine, so publishing it costs
+// nothing; the alternative was `@testable import`, which only works in debug
+// builds and would break `swift build -c release` outright.
+public struct UTF8Incremental {
     private var pending: [UInt8] = []
+
+    public init() {}
 
     /// Feed raw bytes; returns the decoded text for every complete UTF-8
     /// sequence so far. Incomplete trailing bytes are held for next time.
-    mutating func decode(_ bytes: [UInt8]) -> String {
+    public mutating func decode(_ bytes: [UInt8]) -> String {
         pending.append(contentsOf: bytes)
         let split = UTF8Incremental.completePrefixLength(pending)
         if split == 0 { return "" }

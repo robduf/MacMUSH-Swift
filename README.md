@@ -47,15 +47,25 @@ Applications.
 
 ## Tests
 
-The engine (telnet + ANSI parsing) is fully unit-tested:
+The engine (telnet + ANSI parsing) is fully unit-tested — 68 tests:
 
 ```
-swift test
+swift run MudEngineTests
 ```
 
 That's the part with the fiddly logic, so it's covered end-to-end — escape
 sequences split across packets, 256/true-colour, telnet negotiation, echo
 suppression, GA prompts, incremental UTF-8.
+
+Not `swift test`, deliberately. A test target has to `import XCTest`, and
+XCTest lives inside Xcode.app — a Mac with only the Command Line Tools can
+build and run this app perfectly well but cannot run `swift test` at all. So
+the suite is an ordinary executable with a small assertion harness that keeps
+the XCTest function names. It exits non-zero on failure, so CI runs the exact
+same command. See `Tests/MudEngineTests/TestHarness.swift`.
+
+Because there are now two executables, plain `swift run` is ambiguous — name
+the one you want: `swift run MacMUSH` or `swift run MudEngineTests`.
 
 ## Layout
 
@@ -67,13 +77,21 @@ Sources/
     AnsiParser.swift      SGR → styled runs (16/256/truecolor, bold/italic/…)
     TextStyle.swift       colour + style model (no AppKit)
     UTF8Incremental.swift streaming UTF-8 decoder
+    WorldConfig.swift     one world: host, port, triggers, aliases, timers
+    AppConfig.swift       the saved world list + which one is active
+    Matcher.swift         trigger/alias matching (wildcards or regex)
+    SessionFormat.swift   elapsed time, log filenames, log header/footer
   MacMUSH/            the AppKit app (code-only, no storyboards)
     main.swift            NSApplication entry
     AppDelegate.swift     menus
-    WorldWindow.swift     window, text view, input, history
+    WorldWindow.swift     window, text view, input, history, status bar
+    SettingsWindow.swift  world editor (connection, triggers, aliases, logging)
     MudConnection.swift   TCP via Network.framework
     AnsiRenderer.swift    MudColor → NSColor, attributed text
-Tests/MudEngineTests/  XCTest
+    SessionLogger.swift   per-world plain-text session logs
+    WorldStore.swift      loads/saves the world list
+    Storage.swift         where on disk that lives
+Tests/MudEngineTests/  the engine suite + its assertion harness
 scripts/fake-mud.js    a tiny test MUD server
 ```
 

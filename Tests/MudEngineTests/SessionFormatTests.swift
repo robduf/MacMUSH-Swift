@@ -1,7 +1,7 @@
-import XCTest
-@testable import MudEngine
+import Foundation
+import MudEngine
 
-final class SessionFormatTests: XCTestCase {
+final class SessionFormatTests {
 
     // MARK: Elapsed time
 
@@ -191,4 +191,31 @@ final class SessionFormatTests: XCTestCase {
         let calendar = Calendar(identifier: .gregorian)
         return calendar.date(from: components)!
     }
+}
+
+// Every test in this file, listed because a plain executable has no runtime
+// discovery to find them for us. A test missing from here never runs.
+// See TestHarness.swift.
+extension SessionFormatTests {
+    static let suite = TestSuite("SessionFormatTests", [
+        ("testElapsedFormatting", { SessionFormatTests().testElapsedFormatting() }),
+        ("testElapsedTruncatesFractions", { SessionFormatTests().testElapsedTruncatesFractions() }),
+        ("testElapsedDoesNotWrapAtADay", { SessionFormatTests().testElapsedDoesNotWrapAtADay() }),
+        ("testElapsedSurvivesNonsenseInput", { SessionFormatTests().testElapsedSurvivesNonsenseInput() }),
+        ("testElapsedDoesNotClampARealisticallyLongSession", { SessionFormatTests().testElapsedDoesNotClampARealisticallyLongSession() }),
+        ("testSanitizeLeavesOrdinaryNamesAlone", { SessionFormatTests().testSanitizeLeavesOrdinaryNamesAlone() }),
+        ("testSanitizeStripsPathSeparators", { SessionFormatTests().testSanitizeStripsPathSeparators() }),
+        ("testSanitizeRejectsDirectoryReferences", { SessionFormatTests().testSanitizeRejectsDirectoryReferences() }),
+        ("testSanitizeStripsControlCharacters", { SessionFormatTests().testSanitizeStripsControlCharacters() }),
+        ("testSanitizeBoundsLength", { SessionFormatTests().testSanitizeBoundsLength() }),
+        ("testSanitizeBoundsBytesNotCharacters", { SessionFormatTests().testSanitizeBoundsBytesNotCharacters() }),
+        ("testRedactLoginHidesThePassword", { SessionFormatTests().testRedactLoginHidesThePassword() }),
+        ("testRedactLoginErrsTowardsMasking", { SessionFormatTests().testRedactLoginErrsTowardsMasking() }),
+        ("testRedactLoginHandlesTabs", { SessionFormatTests().testRedactLoginHandlesTabs() }),
+        ("testRedactBlockCoversEveryLine", { SessionFormatTests().testRedactBlockCoversEveryLine() }),
+        ("testRedactLoginLeavesOrdinaryLinesAlone", { SessionFormatTests().testRedactLoginLeavesOrdinaryLinesAlone() }),
+        ("testLogFileNameIsSortableAndStable", { SessionFormatTests().testLogFileNameIsSortableAndStable() }),
+        ("testLogFileNameIgnoresSystemLocale", { SessionFormatTests().testLogFileNameIgnoresSystemLocale() }),
+        ("testHeaderAndFooterCarryTheDetailsYouWantMonthsLater", { SessionFormatTests().testHeaderAndFooterCarryTheDetailsYouWantMonthsLater() }),
+    ])
 }

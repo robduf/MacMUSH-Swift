@@ -1,7 +1,7 @@
-import XCTest
-@testable import MudEngine
+import Foundation
+import MudEngine
 
-final class MatcherTests: XCTestCase {
+final class MatcherTests {
 
     func testWildcardWithLiteralSpaces() {
         let t = MatchRule(pattern: "* gives you * apples.", sendText: "thank %1")
@@ -95,4 +95,26 @@ final class MatcherTests: XCTestCase {
         XCTAssertTrue(tm.enabled)
         XCTAssertFalse(tm.oneShot)
     }
+}
+
+// Every test in this file, listed because a plain executable has no runtime
+// discovery to find them for us. A test missing from here never runs.
+// See TestHarness.swift.
+extension MatcherTests {
+    static let suite = TestSuite("MatcherTests", [
+        ("testWildcardWithLiteralSpaces", { MatcherTests().testWildcardWithLiteralSpaces() }),
+        ("testNoMatch", { MatcherTests().testNoMatch() }),
+        ("testRegexSpecialsInWildcardEscaped", { MatcherTests().testRegexSpecialsInWildcardEscaped() }),
+        ("testRegexTriggerWithGroups", { MatcherTests().testRegexTriggerWithGroups() }),
+        ("testGagFlag", { MatcherTests().testGagFlag() }),
+        ("testStopsAtFirstMatchUnlessKeepEvaluating", { MatcherTests().testStopsAtFirstMatchUnlessKeepEvaluating() }),
+        ("testDisabledRulesSkipped", { MatcherTests().testDisabledRulesSkipped() }),
+        ("testCaseSensitivity", { MatcherTests().testCaseSensitivity() }),
+        ("testAliasWithMultipleWildcards", { MatcherTests().testAliasWithMultipleWildcards() }),
+        ("testExpandWildcardsLiteralPercentAndMissing", { MatcherTests().testExpandWildcardsLiteralPercentAndMissing() }),
+        ("testBadRegexIsSkippedNotCrashing", { MatcherTests().testBadRegexIsSkippedNotCrashing() }),
+        ("testMultilineSendExpansion", { MatcherTests().testMultilineSendExpansion() }),
+        ("testWholeMatchWildcardZero", { MatcherTests().testWholeMatchWildcardZero() }),
+        ("testTimerModelDefaults", { MatcherTests().testTimerModelDefaults() }),
+    ])
 }

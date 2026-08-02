@@ -1,7 +1,7 @@
-import XCTest
-@testable import MudEngine
+import Foundation
+import MudEngine
 
-final class AppConfigTests: XCTestCase {
+final class AppConfigTests {
 
     func testCodableRoundTrip() throws {
         let a = WorldConfig(name: "Alpha", host: "a.example.org", port: 4000)
@@ -127,4 +127,23 @@ final class AppConfigTests: XCTestCase {
         decoded.normalize()
         XCTAssertEqual(decoded.worlds.count, 1)
     }
+}
+
+// Every test in this file, listed because a plain executable has no runtime
+// discovery to find them for us. A test missing from here never runs.
+// See TestHarness.swift.
+extension AppConfigTests {
+    static let suite = TestSuite("AppConfigTests", [
+        ("testCodableRoundTrip", { try AppConfigTests().testCodableRoundTrip() }),
+        ("testNormalizeCreatesAWorldWhenEmpty", { AppConfigTests().testNormalizeCreatesAWorldWhenEmpty() }),
+        ("testNormalizeRepairsDanglingSelection", { AppConfigTests().testNormalizeRepairsDanglingSelection() }),
+        ("testSelectedWorldFallsBackToFirst", { AppConfigTests().testSelectedWorldFallsBackToFirst() }),
+        ("testUpdateSelectedReplacesInPlace", { AppConfigTests().testUpdateSelectedReplacesInPlace() }),
+        ("testUpdateReplacesByIDWithoutTouchingSelection", { AppConfigTests().testUpdateReplacesByIDWithoutTouchingSelection() }),
+        ("testUpdateIgnoresUnknownWorld", { AppConfigTests().testUpdateIgnoresUnknownWorld() }),
+        ("testInsertWorldKeepsSelection", { AppConfigTests().testInsertWorldKeepsSelection() }),
+        ("testAddWorldSelectsIt", { AppConfigTests().testAddWorldSelectsIt() }),
+        ("testRemoveWorldReselects", { AppConfigTests().testRemoveWorldReselects() }),
+        ("testLenientDecodeOfEmptyObject", { try AppConfigTests().testLenientDecodeOfEmptyObject() }),
+    ])
 }

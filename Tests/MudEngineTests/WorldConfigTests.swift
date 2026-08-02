@@ -1,7 +1,7 @@
-import XCTest
-@testable import MudEngine
+import Foundation
+import MudEngine
 
-final class WorldConfigTests: XCTestCase {
+final class WorldConfigTests {
 
     func testCodableRoundTrip() throws {
         var config = WorldConfig(name: "Test", host: "mud.example.org", port: 4000)
@@ -74,4 +74,17 @@ final class WorldConfigTests: XCTestCase {
         XCTAssertFalse(decoded.logEnabled)
         XCTAssertEqual(decoded.logDirectory, "")
     }
+}
+
+// Every test in this file, listed because a plain executable has no runtime
+// discovery to find them for us. A test missing from here never runs.
+// See TestHarness.swift.
+extension WorldConfigTests {
+    static let suite = TestSuite("WorldConfigTests", [
+        ("testCodableRoundTrip", { try WorldConfigTests().testCodableRoundTrip() }),
+        ("testLogDirectorySurvivesLoggingBeingOff", { try WorldConfigTests().testLogDirectorySurvivesLoggingBeingOff() }),
+        ("testDefaults", { WorldConfigTests().testDefaults() }),
+        ("testDistinctIDs", { WorldConfigTests().testDistinctIDs() }),
+        ("testLenientDecodeOfLegacyJSON", { try WorldConfigTests().testLenientDecodeOfLegacyJSON() }),
+    ])
 }

@@ -17,9 +17,19 @@ let package = Package(
             name: "MacMUSH",
             dependencies: ["MudEngine"]
         ),
-        .testTarget(
+        // The engine test suite. An executable rather than a `.testTarget`
+        // because a test target needs XCTest, and XCTest ships inside Xcode.app
+        // — a machine with only the Command Line Tools can build and run this
+        // app but cannot run `swift test`. Run it with:
+        //
+        //     swift run MudEngineTests
+        //
+        // It exits non-zero on failure, so CI treats it the same as any other
+        // test command. See Tests/MudEngineTests/TestHarness.swift.
+        .executableTarget(
             name: "MudEngineTests",
-            dependencies: ["MudEngine"]
+            dependencies: ["MudEngine"],
+            path: "Tests/MudEngineTests"
         ),
     ]
 )

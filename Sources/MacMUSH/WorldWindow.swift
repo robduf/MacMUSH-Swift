@@ -55,6 +55,25 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             backing: .buffered,
             defer: false
         )
+        // `layout()` hands both text views their real geometry a few lines down.
+        // These frames only have to be non-degenerate so the layout manager has
+        // somewhere to put glyphs before the first pass — which is more than the
+        // old code managed, since it sized the output view from the contentSize
+        // of a scroll view that was still sitting at the origin with zero area.
+        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 884, height: 452))
+        inputView = NSTextView(frame: NSRect(x: 0, y: 0, width: 860, height: 64))
+
+        // Every stored property this class introduces now holds a value, so
+        // control can pass up to NSObject.
+        //
+        // Nothing above this line may *read* a property. Swift's two-phase
+        // initialisation lets a subclass assign to its own stored properties
+        // before `super.init()` but not read them back, and `window.title = …`
+        // is a read of `window` followed by a write to the object it points at —
+        // which is why every configuration statement now lives below the call
+        // rather than above it.
+        super.init()
+
         window.title = "MacMUSH"
         window.minSize = NSSize(width: 520, height: 320)
         window.isReleasedWhenClosed = false
@@ -65,8 +84,6 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
 
-        let contentSize = scrollView.contentSize
-        textView = NSTextView(frame: NSRect(origin: .zero, size: contentSize))
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
@@ -77,7 +94,8 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         textView.drawsBackground = true
         textView.backgroundColor = renderer.background
         textView.textContainerInset = NSSize(width: 8, height: 6)
-        textView.textContainer?.containerSize = NSSize(width: contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.size = NSSize(width: textView.frame.width,
+                                              height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
         scrollView.documentView = textView
 
@@ -88,8 +106,6 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         inputScroll.drawsBackground = true
         inputScroll.backgroundColor = renderer.background
 
-        let inputSize = NSSize(width: 860, height: 64)
-        inputView = NSTextView(frame: NSRect(origin: .zero, size: inputSize))
         inputView.minSize = NSSize(width: 0, height: 0)
         inputView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                    height: CGFloat.greatestFiniteMagnitude)
@@ -104,8 +120,8 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         inputView.textColor = renderer.defaultForeground
         inputView.insertionPointColor = renderer.defaultForeground
         inputView.textContainerInset = NSSize(width: 2, height: 4)
-        inputView.textContainer?.containerSize = NSSize(width: inputSize.width,
-                                                        height: CGFloat.greatestFiniteMagnitude)
+        inputView.textContainer?.size = NSSize(width: inputView.frame.width,
+                                               height: CGFloat.greatestFiniteMagnitude)
         inputView.textContainer?.widthTracksTextView = true
         // macOS "helpfully" turns "don't" into "don’t" and -- into an em dash.
         // A MUSH takes those literally, so `page bob="don't"` would go out with
@@ -132,8 +148,6 @@ final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // glyph widths change under it.
         elapsedLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         elapsedLabel.textColor = .secondaryLabelColor
-
-        super.init()
 
         inputView.delegate = self
         splitView.delegate = self

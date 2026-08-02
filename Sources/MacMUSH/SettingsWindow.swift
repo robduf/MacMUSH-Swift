@@ -167,8 +167,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         connectTextView.isRichText = false
         connectTextView.isAutomaticQuoteSubstitutionEnabled = false
         connectTextView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        connectTextView.textContainer?.containerSize = NSSize(width: 420,
-                                                              height: CGFloat.greatestFiniteMagnitude)
+        connectTextView.textContainer?.size = NSSize(width: 420,
+                                                     height: CGFloat.greatestFiniteMagnitude)
         connectTextView.textContainer?.widthTracksTextView = true
         connectTextView.delegate = self
         connectScroll.documentView = connectTextView

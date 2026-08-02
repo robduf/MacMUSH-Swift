@@ -1,7 +1,7 @@
-import XCTest
-@testable import MudEngine
+import Foundation
+import MudEngine
 
-final class AnsiParserTests: XCTestCase {
+final class AnsiParserTests {
 
     private func textOps(_ ops: [AnsiOp]) -> [StyledText] {
         ops.compactMap { if case .text(let t) = $0 { return t } else { return nil } }
@@ -111,4 +111,24 @@ final class AnsiParserTests: XCTestCase {
         let ops = p.feed("ding\u{07}")
         XCTAssertTrue(ops.contains(.bell))
     }
+}
+
+// Every test in this file, listed because a plain executable has no runtime
+// discovery to find them for us. A test missing from here never runs.
+// See TestHarness.swift.
+extension AnsiParserTests {
+    static let suite = TestSuite("AnsiParserTests", [
+        ("testBasicColorAndReset", { AnsiParserTests().testBasicColorAndReset() }),
+        ("testBoldBright256AndTruecolor", { AnsiParserTests().testBoldBright256AndTruecolor() }),
+        ("testBackgroundAndBrightForeground", { AnsiParserTests().testBackgroundAndBrightForeground() }),
+        ("testEscapeSplitAcrossChunks", { AnsiParserTests().testEscapeSplitAcrossChunks() }),
+        ("testNewlinesAndCarriageReturns", { AnsiParserTests().testNewlinesAndCarriageReturns() }),
+        ("testCRLFLineEndings", { AnsiParserTests().testCRLFLineEndings() }),
+        ("testStylePersistsAcrossChunks", { AnsiParserTests().testStylePersistsAcrossChunks() }),
+        ("testUnderlineItalicStrikeToggles", { AnsiParserTests().testUnderlineItalicStrikeToggles() }),
+        ("testNonSGRSequencesSwallowed", { AnsiParserTests().testNonSGRSequencesSwallowed() }),
+        ("testOSCSequencesSwallowed", { AnsiParserTests().testOSCSequencesSwallowed() }),
+        ("testEmptySGRResets", { AnsiParserTests().testEmptySGRResets() }),
+        ("testBellEmitted", { AnsiParserTests().testBellEmitted() }),
+    ])
 }
