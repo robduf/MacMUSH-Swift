@@ -14,6 +14,18 @@ final class AnsiRenderer {
     let defaultForeground = Theme.foreground
     let background = Theme.scrollback
 
+    /// Whether URLs in text rendered from here on become clickable links.
+    ///
+    /// Per world for free: every `Session` builds its own renderer, so this is
+    /// just that world's `linkifyURLs` copied across whenever its config is.
+    ///
+    /// Only affects text rendered *after* it changes — lines already in the
+    /// scrollback keep the attributes they were built with. That's why
+    /// `Session`'s click handler consults the setting too rather than trusting
+    /// what's in the storage: turning links off should stop them opening now,
+    /// not gradually as the old text scrolls away.
+    var linksEnabled = true
+
     /// How much scrollback to keep, in characters, and how far back to cut when
     /// there's more than that.
     ///
@@ -47,7 +59,7 @@ final class AnsiRenderer {
                 result.append(attributed(styled))
             }
         }
-        AnsiRenderer.linkify(result)
+        if linksEnabled { AnsiRenderer.linkify(result) }
         storage.append(result)
 
         if storage.length > maxLength {
@@ -65,7 +77,7 @@ final class AnsiRenderer {
         // pastes one into a channel and it comes back through the echo — and a
         // link that works in one half of the scrollback but not the other is
         // worse than no links at all.
-        AnsiRenderer.linkify(line)
+        if linksEnabled { AnsiRenderer.linkify(line) }
         return line
     }
 

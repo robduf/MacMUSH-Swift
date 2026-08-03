@@ -318,6 +318,9 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // Every stored property this class introduces now holds a value, so
         // control can pass up to NSObject.
         //
+        // `renderer` is one of them, but it can't be configured from `world`
+        // until after the call — see below.
+        //
         // Nothing above this line may *read* a property. Swift's two-phase
         // initialisation lets a subclass assign to its own stored properties
         // before `super.init()` but not read them back, and `scrollView.foo = …`
@@ -325,6 +328,8 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // at — which is why every configuration statement lives below the call
         // rather than above it.
         super.init()
+
+        applyWorldSettings()
 
         // --- output text view inside a scroll view ---
         // First, before anything else touches the scroll view. Two reasons, and
@@ -795,6 +800,17 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     /// The world this session is currently bound to.
     var worldID: String { config.id }
 
+    /// Push the settings that live somewhere other than `config` out to whoever
+    /// holds them.
+    ///
+    /// A method rather than a line repeated at each of the three places `config`
+    /// is assigned, because the fourth such place — added a year from now by
+    /// someone who doesn't know this list exists — is exactly how a setting
+    /// starts silently applying to some worlds and not others.
+    private func applyWorldSettings() {
+        renderer.linksEnabled = config.linkifyURLs
+    }
+
     /// Switch this session to a different saved world. Drops any current
     /// connection; the new world connects on the next ⌘R / /connect.
     func activate(world: WorldConfig) {
@@ -802,6 +818,7 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             disconnect()
         }
         config = world
+        applyWorldSettings()
         ansi.resetStyle()
         pendingOps = []
         pendingPlain = ""
@@ -821,6 +838,7 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         let oldDirectory = config.logDirectory
         let wasEnabled = config.logEnabled
         config = world
+        applyWorldSettings()
         onChange?()
         reconcileTimers()
 
@@ -1249,6 +1267,57 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         inputView.didChangeText()
     }
 
+    // MARK: Macros
+
+    /// This world's quick-reference macros — what the palette draws, and what
+    /// the key dispatcher searches.
+    var macros: [Macro] { config.macros }
+
+    /// Run a macro: fire it, or load it into the command box ready to edit.
+    ///
+    /// Which of the two is the macro's own setting rather than a global one,
+    /// because both kinds are useful and a client that picks for you gets it
+    /// wrong half the time. `+who` wants to go the instant you click it;
+    /// `+who/find F H any/R29` has a bit in the middle you change every time.
+    ///
+    /// The firing path goes through `submit`, the same one Return in the command
+    /// box uses. That's deliberate: a macro can then use an alias or a slash
+    /// command exactly as you could by hand, and echoing is decided in one place
+    /// for both rather than in two places that drift apart.
+    /// Returns whether it did anything. The key dispatcher needs to know: a
+    /// macro with a key but no text yet must not swallow that key, or binding
+    /// ⌘V to a row you meant to fill in later silently kills Paste.
+    @discardableResult
+    func runMacro(_ macro: Macro) -> Bool {
+        guard !macro.sendText.isEmpty else { return false }
+
+        guard macro.sendImmediately else {
+            // Whatever was half-typed in the box is replaced. `setInputText`
+            // goes through the text system properly, so ⌘Z brings it back —
+            // which is the difference between a slip and a loss.
+            setInputText(macro.sendText)
+            focusInput()
+            // Caret at the end, not a selection of the whole thing: the next
+            // thing typed should extend the command, not wipe it.
+            //
+            // Property, not `setSelectedRange(_:)` — that pair imports into
+            // Swift as a settable property, the same way `recallHistory` and
+            // the completion code below set it.
+            inputView.selectedRange =
+                NSRange(location: (macro.sendText as NSString).length, length: 0)
+            return true
+        }
+
+        // One "Not connected." for a multi-line macro rather than one per line,
+        // the same reason `sendFromInput` clears this before its own loop.
+        warnedNotConnected = false
+        // Not added to history. History is for recalling what you typed, and a
+        // macro is already a click and a keystroke away — putting it in ↑ as
+        // well would push the things that *are* hard to retype further back.
+        for line in macro.sendText.components(separatedBy: "\n") { submit(line) }
+        return true
+    }
+
     /// One line of what the user typed: a slash command, an alias, or plain text
     /// straight to the MUD.
     private func submit(_ line: String) {
@@ -1317,6 +1386,15 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         default:                  clicked = nil
         }
         guard let url = clicked else { return true }
+        // Links turned off after this line was rendered. The `.link` attribute
+        // is still sitting in the storage — repainting the whole scrollback to
+        // strip it would be a lot of work to achieve what one comparison does —
+        // so the setting is enforced here instead, at the only moment it
+        // matters.
+        guard renderer.linksEnabled else {
+            appendSystem("Links are off for this world. Turn them back on in Settings ▸ Connection.")
+            return true
+        }
         guard AnsiRenderer.isOpenable(url) else {
             appendSystem("Not opening \(url.absoluteString) — MacMUSH only follows http and https links.")
             return true

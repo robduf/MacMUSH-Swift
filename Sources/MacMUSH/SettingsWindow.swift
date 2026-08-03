@@ -48,6 +48,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
                                      target: nil, action: nil)
     private let chimeCheck = NSButton(checkboxWithTitle: "Chime when this world talks in the background",
                                       target: nil, action: nil)
+    private let linksCheck = NSButton(checkboxWithTitle: "Turn web addresses into clickable links",
+                                      target: nil, action: nil)
 
     // Logging — per world, so you can keep a transcript of one MUSH and not another.
     private let logCheck = NSButton(checkboxWithTitle: "Save a log of every session",
@@ -59,6 +61,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     private let triggersTable = NSTableView()
     private let aliasesTable = NSTableView()
     private let timersTable = NSTableView()
+    private let macrosTable = NSTableView()
 
     // Working copy of the store, plus which world the right-hand panes show.
     private var worlds: [WorldConfig] = []
@@ -74,6 +77,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         case trigger = "trg"
         case alias = "als"
         case timer = "tmr"
+        case macro = "mac"
 
         var hint: String {
             switch self {
@@ -83,6 +87,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
                 return "Patterns match what you type. * is a wildcard; %1…%9 insert the wildcards into Send."
             case .timer:
                 return "Fires every N seconds while connected. Tick Once to fire a single time."
+            case .macro:
+                // The last sentence is the only warning there is that a key can
+                // be taken off a menu command. Putting it here rather than in an
+                // alert at record time keeps it in front of you the whole time
+                // you're assigning keys, which is when it matters.
+                return "Buttons in the macro palette (⌘K). Tick Now to send on click, or leave it to edit first. "
+                    + "A key a menu already uses — ⌘C, ⌘W — belongs to the macro while this world is in front."
             }
         }
     }
@@ -113,10 +124,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
     private func configure() {
         window.title = "Worlds"
-        // 480 rather than 420: the Connection pane grew a logging checkbox and a
-        // folder row, and at the old minimum they had barely fifteen points of
-        // slack before Auto Layout started breaking constraints to fit.
-        window.minSize = NSSize(width: 700, height: 480)
+        // 510 rather than 480: the Connection pane is a fixed stack of rows with
+        // no give in it, so every checkbox added to it has to be paid for here.
+        // The links row costs an 8pt gap plus its own ~18pt, and 480 had barely
+        // fifteen points spare before Auto Layout started breaking constraints
+        // to fit. Add another row to that pane and this has to go up again.
+        window.minSize = NSSize(width: 700, height: 510)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
@@ -126,6 +139,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         configureRuleTable(triggersTable, kind: .trigger)
         configureRuleTable(aliasesTable, kind: .alias)
         configureRuleTable(timersTable, kind: .timer)
+        configureRuleTable(macrosTable, kind: .macro)
         layout()
     }
 
@@ -197,6 +211,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         chimeCheck.action = #selector(chimeCheckToggled)
         chimeCheck.toolTip = "The same setting as the bell in this world's status bar."
 
+        linksCheck.target = self
+        linksCheck.action = #selector(linksCheckToggled)
+        linksCheck.toolTip = "Off leaves web addresses as plain text you can select and copy.\n"
+            + "Only http and https addresses are ever opened, whichever way this is set."
+
         logCheck.target = self
         logCheck.action = #selector(logCheckToggled)
 
@@ -237,6 +256,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             addColumn(table, "seconds", "Seconds", width: 66, minWidth: 56)
             addColumn(table, "once", "Once", width: 42, minWidth: 42)
             addColumn(table, "send", "Send", width: 354)
+        case .macro:
+            // No "On" column: a macro you don't want is a button you don't press,
+            // and one you want gone has a − button right below the table. The
+            // other three kinds fire on their own, which is what makes a way to
+            // silence them without deleting them worth a column.
+            addColumn(table, "label", "Button", width: 120)
+            addColumn(table, "now", "Now", width: 40, minWidth: 40)
+            addColumn(table, "key", "Key", width: 90, minWidth: 70)
+            addColumn(table, "send", "Send", width: 250)
         }
         table.rowHeight = 22
         table.usesAlternatingRowBackgroundColors = true
@@ -274,6 +302,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         tabView.addTabViewItem(makeTab("Triggers", rulePane(triggersTable, kind: .trigger)))
         tabView.addTabViewItem(makeTab("Aliases", rulePane(aliasesTable, kind: .alias)))
         tabView.addTabViewItem(makeTab("Timers", rulePane(timersTable, kind: .timer)))
+        tabView.addTabViewItem(makeTab("Macros", rulePane(macrosTable, kind: .macro)))
 
         for view in [sidebarScroll, worldButtons, tabView] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -316,7 +345,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
         for view in [nameLabel, hostLabel, portLabel, sendLabel,
                      nameField, hostField, portField, connectScroll,
-                     echoCheck, chimeCheck,
+                     echoCheck, chimeCheck, linksCheck,
                      logCheck, logPathField, logChooseButton,
                      makeActiveButton, activeLabel] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -369,7 +398,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             chimeCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             chimeCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
 
-            logCheck.topAnchor.constraint(equalTo: chimeCheck.bottomAnchor, constant: 8),
+            linksCheck.topAnchor.constraint(equalTo: chimeCheck.bottomAnchor, constant: 8),
+            linksCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            linksCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
+
+            logCheck.topAnchor.constraint(equalTo: linksCheck.bottomAnchor, constant: 8),
             logCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             logCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
 
@@ -488,6 +521,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         connectTextView.string = world.connectText
         echoCheck.state = world.echoInput ? .on : .off
         chimeCheck.state = world.chimeEnabled ? .on : .off
+        linksCheck.state = world.linkifyURLs ? .on : .off
         logCheck.state = world.logEnabled ? .on : .off
         logPathField.stringValue = world.logDirectory
         updateLogControls()
@@ -495,6 +529,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         triggersTable.reloadData()
         aliasesTable.reloadData()
         timersTable.reloadData()
+        // Not while a key is being recorded. `reloadData` throws the row views
+        // away, which takes the armed recorder out of the window and disarms it
+        // — so a store change from somewhere else entirely (a session's one-shot
+        // timer expiring is the likely one) would make the key you were in the
+        // middle of pressing do nothing, with no explanation. Nothing outside
+        // this window can change a world's macros, so skipping the reload can't
+        // leave anything stale on screen; the recording commits in a second and
+        // reloads this itself if it needs to.
+        if ShortcutRecorder.armed == nil { macrosTable.reloadData() }
     }
 
     private func updateActiveLabel() {
@@ -524,6 +567,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         case .trigger: return world.triggers.count
         case .alias: return world.aliases.count
         case .timer: return world.timers.count
+        case .macro: return world.macros.count
         }
     }
 
@@ -559,6 +603,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             case "seconds": return textCell(tableView, identifier: identifier, value: secondsText(timer.seconds))
             case "send": return textCell(tableView, identifier: identifier, value: timer.sendText)
             case "once": return checkCell(tableView, identifier: identifier, on: timer.oneShot)
+            default: return nil
+            }
+        case .macro:
+            guard row < world.macros.count else { return nil }
+            let macro = world.macros[row]
+            switch columnID {
+            case "label": return textCell(tableView, identifier: identifier, value: macro.label)
+            case "send": return textCell(tableView, identifier: identifier, value: macro.sendText)
+            case "now": return checkCell(tableView, identifier: identifier, on: macro.sendImmediately)
+            case "key": return shortcutCell(tableView, identifier: identifier, shortcut: macro.shortcut)
             default: return nil
             }
         }
@@ -605,6 +659,26 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         return field
     }
 
+    /// The Key column. Reused like the other two cell kinds, which is safe
+    /// because assigning `shortcut` cancels any recording the view was in the
+    /// middle of — a recorder scrolled away while armed must not file the next
+    /// key press under whichever macro it was handed next.
+    private func shortcutCell(_ table: NSTableView, identifier: String,
+                              shortcut: KeyShortcut?) -> ShortcutRecorder {
+        let id = NSUserInterfaceItemIdentifier(identifier)
+        let recorder: ShortcutRecorder
+        if let reused = table.makeView(withIdentifier: id, owner: self) as? ShortcutRecorder {
+            recorder = reused
+        } else {
+            recorder = ShortcutRecorder(frame: .zero)
+            recorder.identifier = id
+            recorder.target = self
+            recorder.action = #selector(shortcutRecorded(_:))
+        }
+        recorder.shortcut = shortcut
+        return recorder
+    }
+
     private func checkCell(_ table: NSTableView, identifier: String, on: Bool) -> NSButton {
         let id = NSUserInterfaceItemIdentifier(identifier)
         let box: NSButton
@@ -622,6 +696,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         if table === triggersTable { return .trigger }
         if table === aliasesTable { return .alias }
         if table === timersTable { return .timer }
+        if table === macrosTable { return .macro }
         return nil
     }
 
@@ -630,6 +705,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         case .trigger: return triggersTable
         case .alias: return aliasesTable
         case .timer: return timersTable
+        case .macro: return macrosTable
         }
     }
 
@@ -755,6 +831,22 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             default:
                 return
             }
+
+        case .macro:
+            guard row < worlds[i].macros.count else { return }
+            switch key {
+            case "label":
+                // Not trimmed and not rejected when empty: a blank label is a
+                // real choice, and `Macro.displayLabel` falls back to the
+                // command itself, which for `+who` is the better button anyway.
+                guard worlds[i].macros[row].label != value else { return }
+                worlds[i].macros[row].label = value
+            case "send":
+                guard worlds[i].macros[row].sendText != value else { return }
+                worlds[i].macros[row].sendText = value
+            default:
+                return
+            }
         }
 
         commitWorld(at: i)
@@ -768,6 +860,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         let row = ruleTable(for: kind).row(for: sender)
         guard row >= 0 else { return }
         let on = sender.state == .on
+
+        // Before `worlds` is read below. A tick lands on a checkbox without
+        // ending an edit somewhere else in the table, so without this a cell
+        // still being typed into gets written back at its pre-edit value.
+        endEditing()
 
         switch kind {
         case .trigger, .alias:
@@ -786,6 +883,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             switch key {
             case "enabled": worlds[i].timers[row].enabled = on
             case "once": worlds[i].timers[row].oneShot = on
+            default: return
+            }
+
+        case .macro:
+            guard row < worlds[i].macros.count else { return }
+            switch key {
+            case "now": worlds[i].macros[row].sendImmediately = on
             default: return
             }
         }
@@ -826,6 +930,65 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         guard worlds[i].chimeEnabled != on else { return }
         worlds[i].chimeEnabled = on
         commitWorld(at: i)
+    }
+
+    @objc private func linksCheckToggled() {
+        endEditing()
+        guard let i = editingIndex else { return }
+        let on = linksCheck.state == .on
+        guard worlds[i].linkifyURLs != on else { return }
+        worlds[i].linkifyURLs = on
+        commitWorld(at: i)
+    }
+
+    // MARK: Macros
+
+    /// A key was recorded — or cleared — in the Key column.
+    ///
+    /// Takes `NSButton` rather than `ShortcutRecorder` to match every other
+    /// action handler here, and because the cast is needed anyway: `row(for:)`
+    /// wants a view and the shortcut wants the concrete type.
+    @objc private func shortcutRecorded(_ sender: NSButton) {
+        guard let recorder = sender as? ShortcutRecorder else { return }
+        // Read before anything can move it: `endEditing` below commits a pending
+        // cell edit, and a commit can rebuild the table, after which this view is
+        // no longer in it and `row(for:)` answers -1.
+        let row = macrosTable.row(for: recorder)
+        let recorded = recorder.shortcut
+
+        // Before `worlds` is read, not after. A Send cell may still have an open
+        // field editor holding text that was typed but never committed — writing
+        // the command and *then* giving it a key is the natural order to do this
+        // in — and `endEditing` is what flushes that into `worlds`. Read first
+        // and flush second and the pre-edit text gets written back over it, then
+        // the `reloadData` at the end wipes what was on screen.
+        endEditing()
+
+        guard let i = editingIndex, row >= 0, row < worlds[i].macros.count else { return }
+
+        // Two macros on one key means one of them silently never fires, and
+        // which one is an accident of array order. Take it off the other rather
+        // than refusing this one: the person pressing the key just told us which
+        // macro they meant, and the row that lost it says "Set…" again in front
+        // of them rather than failing quietly later.
+        var stolen = false
+        if let new = recorded {
+            for other in worlds[i].macros.indices where other != row {
+                guard worlds[i].macros[other].shortcut?
+                        .matches(keyCode: new.keyCode, modifiers: new.modifiers) == true else {
+                    continue
+                }
+                worlds[i].macros[other].shortcut = nil
+                stolen = true
+            }
+        }
+
+        guard stolen || worlds[i].macros[row].shortcut != recorded else { return }
+        worlds[i].macros[row].shortcut = recorded
+        commitWorld(at: i)
+        // Only when a key moved: reloading rebuilds every row, and doing it on
+        // each recording would be visible churn for nothing.
+        if stolen { macrosTable.reloadData() }
     }
 
     // MARK: Logging
@@ -899,6 +1062,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
                 worlds[i].aliases.append(MatchRule(pattern: "gt * *", sendText: "give %2 to %1"))
             case .timer:
                 worlds[i].timers.append(MudTimer(seconds: 60, sendText: ""))
+            case .macro:
+                worlds[i].macros.append(Macro(label: "Who", sendText: "+who"))
             }
             commitWorld(at: i)
             table.reloadData()
@@ -920,6 +1085,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             case .timer:
                 guard row < worlds[i].timers.count else { return }
                 worlds[i].timers.remove(at: row)
+            case .macro:
+                guard row < worlds[i].macros.count else { return }
+                worlds[i].macros.remove(at: row)
             }
             commitWorld(at: i)
             table.reloadData()

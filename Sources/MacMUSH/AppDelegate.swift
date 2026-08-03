@@ -2,13 +2,19 @@
 import AppKit
 import MudEngine
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var settingsWindow: SettingsWindow?
     private var worldsMenu: NSMenu?
+    /// Built the first time ⌘K is pressed and kept for the life of the app.
+    private var macroPalette: MacroPalette?
+    /// The macro key dispatcher. Held so it's installed exactly once; it is
+    /// never removed, because it lives as long as the app does.
+    private var macroKeyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        installMacroKeyMonitor()
 
         WindowManager.shared.openInitialWindow()
 
@@ -120,6 +126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenu.addItem(.separator())
+        // ⌘K. Free, unlike ⌘1…⌘9 — those are the Worlds menu — and unlike the
+        // dozen combinations File and Edit already hold.
+        let macrosItem = windowMenu.addItem(withTitle: "Macros",
+                                            action: #selector(toggleMacroPalette),
+                                            keyEquivalent: "k")
+        macrosItem.target = self
+        windowMenu.addItem(.separator())
         NSApp.windowsMenu = windowMenu
 
         NSApp.mainMenu = mainMenu
@@ -158,6 +171,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func worldStoreChanged() {
         rebuildWorldsMenu()
         WindowManager.shared.syncAll()
+    }
+
+    /// Ticks the Macros item while the palette is up. Everything else targeted
+    /// at this object stays enabled, which is what AppKit was already doing
+    /// before this method existed.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleMacroPalette) {
+            menuItem.state = (macroPalette?.isVisible == true) ? .on : .off
+        }
+        return true
+    }
+
+    // MARK: Macros
+
+    @objc private func toggleMacroPalette() {
+        if macroPalette == nil { macroPalette = MacroPalette() }
+        macroPalette?.toggle()
+    }
+
+    /// Watch every key press for one a macro in the frontmost world has claimed.
+    ///
+    /// A local monitor rather than the responder chain, because a monitor sees
+    /// the event *before* the main menu gets to claim its key equivalents. That
+    /// is the only way a macro on a ⌘-combination can work at all: route this
+    /// through `keyDown` and ⌘C would reach Edit ▸ Copy first and the macro
+    /// would never run. The same technique the shortcut recorder uses, for the
+    /// same reason.
+    ///
+    /// Its one visible consequence: a macro bound to ⌘K wins over the Macros
+    /// menu item above. That's the right way round — the person who bound it
+    /// said what they wanted more recently than this file did — but it does mean
+    /// the palette is then reachable only from the menu.
+    private func installMacroKeyMonitor() {
+        guard macroKeyMonitor == nil else { return }
+        macroKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            // nil swallows the event; returning it lets it carry on to the menu
+            // and then the responder chain, exactly as if this weren't here.
+            return self.runMacro(for: event) ? nil : event
+        }
+    }
+
+    /// Whether this key press belonged to a macro — and if so, having run it.
+    private func runMacro(for event: NSEvent) -> Bool {
+        // Only when a world window is the thing you're typing into. Deliberately
+        // *not* `WindowManager.activeSession`, which falls back to the last
+        // window you used: that would let a key pressed in Settings, or in the
+        // palette's own title bar, fire a command into a world behind them.
+        //
+        // It's also what keeps this out of the shortcut recorder's way. While
+        // you're recording a key in Settings, the key window is Settings, so
+        // this returns here and the recorder's own monitor gets the press.
+        guard let window = NSApp.keyWindow,
+              let worldWindow = window.delegate as? WorldWindow,
+              let session = worldWindow.activeSession else { return false }
+
+        // An alert or a sheet is up. Whatever it's asking, the answer isn't a
+        // command sent to the MUD behind it.
+        guard NSApp.modalWindow == nil, window.attachedSheet == nil else { return false }
+
+        let modifiers = event.shortcutModifiers
+        // A macro with no text yet doesn't count as a match. Otherwise a row
+        // given a key before its command — which is the order you'd fill one in
+        // if you got distracted — swallows that key and does nothing with it:
+        // put ⌘V on a blank row and Paste quietly stops working in that world,
+        // with nothing on screen to say why.
+        guard let macro = session.macros.first(where: {
+            !$0.sendText.isEmpty
+                && $0.shortcut?.matches(keyCode: event.keyCode, modifiers: modifiers) == true
+        }) else { return false }
+
+        // Swallowed, but not run again: holding the key down would otherwise
+        // send the command as fast as the keyboard repeats. Letting the repeats
+        // through instead would type the macro's own key into the command box.
+        guard !event.isARepeat else { return true }
+
+        return session.runMacro(macro)
     }
 
     // MARK: Actions

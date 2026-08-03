@@ -13,6 +13,14 @@ final class WorldConfigTests {
         config.logDirectory = "/Users/somebody/Logs"
         config.chimeEnabled = true
         config.echoInput = false
+        config.linkifyURLs = false
+        config.macros = [
+            Macro(label: "Who", sendText: "+who"),
+            Macro(label: "Find",
+                  sendText: "+who/find F H any/R29",
+                  sendImmediately: false,
+                  shortcut: KeyShortcut(keyCode: 3, modifiers: 1_048_576, label: "⌘F")),
+        ]
 
         let data = try JSONEncoder().encode(config)
         let decoded = try JSONDecoder().decode(WorldConfig.self, from: data)
@@ -26,6 +34,24 @@ final class WorldConfigTests {
         XCTAssertEqual(decoded.logDirectory, "/Users/somebody/Logs")
         XCTAssertTrue(decoded.chimeEnabled)
         XCTAssertFalse(decoded.echoInput)
+        XCTAssertFalse(decoded.linkifyURLs)
+        XCTAssertEqual(decoded.macros.count, 2)
+        XCTAssertEqual(decoded.macros.first?.label, "Who")
+        XCTAssertEqual(decoded.macros.last?.shortcut?.label, "⌘F")
+        XCTAssertEqual(decoded.macros.last?.sendImmediately, false)
+    }
+
+    /// Macros are per world, so two worlds' palettes must not be able to leak
+    /// into one another through anything shared at the model layer.
+    func testMacrosAreIndependentPerWorld() {
+        var a = WorldConfig(name: "A")
+        var b = WorldConfig(name: "B")
+        a.macros = [Macro(label: "Who", sendText: "+who")]
+        b.macros = [Macro(label: "Look", sendText: "look"), Macro(label: "OOC", sendText: "ooc ")]
+
+        XCTAssertEqual(a.macros.count, 1)
+        XCTAssertEqual(b.macros.count, 2)
+        XCTAssertEqual(a.macros.first?.sendText, "+who")
     }
 
     /// Both of the per-world switches have to survive being set *away* from
@@ -36,12 +62,14 @@ final class WorldConfigTests {
         var config = WorldConfig(name: "Shang")
         config.echoInput = false        // defaults true
         config.chimeEnabled = true      // defaults false
+        config.linkifyURLs = false      // defaults true
 
         let decoded = try JSONDecoder().decode(
             WorldConfig.self, from: try JSONEncoder().encode(config))
 
         XCTAssertFalse(decoded.echoInput)
         XCTAssertTrue(decoded.chimeEnabled)
+        XCTAssertFalse(decoded.linkifyURLs)
     }
 
     /// Logging off with a folder still remembered: turning the checkbox back on
@@ -69,6 +97,9 @@ final class WorldConfigTests {
         // other test in the file and quietly stop new worlds echoing.
         XCTAssertTrue(config.echoInput)
         XCTAssertFalse(config.chimeEnabled)
+        // The second field that defaults on, and pinned for the same reason.
+        XCTAssertTrue(config.linkifyURLs)
+        XCTAssertTrue(config.macros.isEmpty)
     }
 
     /// Two freshly-created worlds get distinct ids.
@@ -102,10 +133,17 @@ final class WorldConfigTests {
         // The chime is the same story: silent unless asked for.
         XCTAssertFalse(decoded.chimeEnabled)
 
-        // Echo is the one field that defaults the other way. The client this
+        // Echo is one of two fields that default the other way. The client this
         // JSON was written by echoed what you typed, so decoding it as "off"
         // would look like an upgrade had thrown the setting away.
         XCTAssertTrue(decoded.echoInput)
+
+        // Link resolution is the other: it was unconditional before there was a
+        // switch, so an old world file has to keep its links live.
+        XCTAssertTrue(decoded.linkifyURLs)
+
+        // Macros are new, and nobody had any.
+        XCTAssertTrue(decoded.macros.isEmpty)
     }
 }
 
@@ -117,6 +155,7 @@ extension WorldConfigTests {
         ("testCodableRoundTrip", { try WorldConfigTests().testCodableRoundTrip() }),
         ("testLogDirectorySurvivesLoggingBeingOff", { try WorldConfigTests().testLogDirectorySurvivesLoggingBeingOff() }),
         ("testTogglesSurviveTheirNonDefaultValue", { try WorldConfigTests().testTogglesSurviveTheirNonDefaultValue() }),
+        ("testMacrosAreIndependentPerWorld", { WorldConfigTests().testMacrosAreIndependentPerWorld() }),
         ("testDefaults", { WorldConfigTests().testDefaults() }),
         ("testDistinctIDs", { WorldConfigTests().testDistinctIDs() }),
         ("testLenientDecodeOfLegacyJSON", { try WorldConfigTests().testLenientDecodeOfLegacyJSON() }),

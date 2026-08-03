@@ -9,6 +9,7 @@ import Foundation
 let suites: [TestSuite] = [
     AnsiParserTests.suite,
     AppConfigTests.suite,
+    MacroTests.suite,
     MatcherTests.suite,
     SessionFormatTests.suite,
     TelnetParserTests.suite,

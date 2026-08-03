@@ -306,6 +306,9 @@ final class WorldWindow: NSObject, NSWindowDelegate {
         ])
         window.title = "MacMUSH — \(session.title)"
         session.focusInput()
+        // The one choke point for "which world is frontmost in this window":
+        // selecting a tab, adding one and closing one all come through here.
+        WindowManager.shared.activeSessionChanged()
     }
 
     /// Ask for the bar to be brought up to date, at most once per turn of the

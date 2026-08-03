@@ -20,6 +20,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
     public var logDirectory: String        // "" means the per-world default folder
     public var chimeEnabled: Bool          // sound when this world talks in the background
     public var echoInput: Bool             // show what you type in the scrollback
+    public var linkifyURLs: Bool           // turn web addresses in the text into links
+    public var macros: [Macro]             // quick-reference buttons for this world
 
     public init(id: String = UUID().uuidString,
                 name: String = "My World",
@@ -32,7 +34,9 @@ public struct WorldConfig: Codable, Equatable, Sendable {
                 logEnabled: Bool = false,
                 logDirectory: String = "",
                 chimeEnabled: Bool = false,
-                echoInput: Bool = true) {
+                echoInput: Bool = true,
+                linkifyURLs: Bool = true,
+                macros: [Macro] = []) {
         self.id = id
         self.name = name
         self.host = host
@@ -45,11 +49,14 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.logDirectory = logDirectory
         self.chimeEnabled = chimeEnabled
         self.echoInput = echoInput
+        self.linkifyURLs = linkifyURLs
+        self.macros = macros
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, host, port, connectText, triggers, aliases, timers
         case logEnabled, logDirectory, chimeEnabled, echoInput
+        case linkifyURLs, macros
     }
 
     public init(from decoder: Decoder) throws {
@@ -72,6 +79,11 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         // mean on or upgrading would silently stop showing people their own
         // typing.
         self.echoInput = try c.decodeIfPresent(Bool.self, forKey: .echoInput) ?? true
+        // Same story as echo: links were always live before there was a switch
+        // for them, so absent means on. Turning it off is the new behaviour and
+        // has to be asked for.
+        self.linkifyURLs = try c.decodeIfPresent(Bool.self, forKey: .linkifyURLs) ?? true
+        self.macros = try c.decodeIfPresent([Macro].self, forKey: .macros) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -88,5 +100,7 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         try c.encode(logDirectory, forKey: .logDirectory)
         try c.encode(chimeEnabled, forKey: .chimeEnabled)
         try c.encode(echoInput, forKey: .echoInput)
+        try c.encode(linkifyURLs, forKey: .linkifyURLs)
+        try c.encode(macros, forKey: .macros)
     }
 }

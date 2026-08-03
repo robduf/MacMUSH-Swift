@@ -2,6 +2,16 @@
 import AppKit
 import MudEngine
 
+extension Notification.Name {
+    /// The session a command would act on has changed — a different tab came
+    /// forward, a different window became key, or the last window closed.
+    ///
+    /// Distinct from `.worldStoreDidChange`, which is about a world's *contents*
+    /// being edited. This one is about which world you're looking at, and
+    /// nothing persisted has moved.
+    static let activeSessionDidChange = Notification.Name("MacMUSH.activeSessionDidChange")
+}
+
 /// Owns every open window and answers "where is world X?".
 ///
 /// The rule the whole design hangs on: **one world, one tab, app-wide.** Two
@@ -166,6 +176,19 @@ final class WindowManager {
 
     func windowBecameKey(_ window: WorldWindow) {
         lastKeyWindow = window
+        activeSessionChanged()
+    }
+
+    /// Tell anyone tracking the frontmost world — the macro palette — that it's
+    /// a different one now.
+    ///
+    /// Called from the three places the answer can change: a tab coming forward
+    /// inside a window, a window becoming key, and the last window closing. A
+    /// notification rather than a direct call because the palette is optional
+    /// furniture that may not exist, and windows have no business knowing
+    /// whether it does.
+    func activeSessionChanged() {
+        NotificationCenter.default.post(name: .activeSessionDidChange, object: self)
     }
 
     func windowClosed(_ window: WorldWindow) {
@@ -187,6 +210,10 @@ final class WindowManager {
         // window that isn't on screen any more.
         DispatchQueue.main.async { withExtendedLifetime(window) {} }
         windows.removeAll { $0 === window }
+        // After the removal, so listeners read the list as it is now. Closing
+        // the last window is the case that needs this: no other window becomes
+        // key, so nothing else would say the palette has nothing to show.
+        activeSessionChanged()
     }
 
     // MARK: Broadcast
