@@ -87,6 +87,99 @@ private final class VerticalOnlyClipView: NSClipView {
     }
 }
 
+/// One of the small readouts at the right-hand end of the status line — "LOG",
+/// the bell — which you can also click to change what it's reporting.
+///
+/// A button rather than a label, and always on screen rather than hidden when
+/// off, because a status line that only shows you the things that happen to be
+/// switched on can't tell you what's available to switch. Off is drawn in the
+/// same muted grey for every toggle, so "dim" reads as "not doing anything"
+/// wherever it appears; on is whatever colour suits the particular thing.
+private final class StatusToggle: NSButton {
+    /// What a toggle is up to, which is not always the two things you'd expect.
+    enum Level {
+        /// Off, and not asked for.
+        case off
+        /// Asked for, but not actually happening: logging ticked on while the
+        /// world is disconnected, or a log whose folder couldn't be written to.
+        /// Drawn in a faded version of the on colour — the distinction matters,
+        /// because "I turned that on" and "that is running" being the same
+        /// colour is exactly how a silently failed log goes unnoticed.
+        case armed
+        /// On and doing its job.
+        case on
+    }
+
+    /// Shown when there's no symbol to draw, and used as the button's
+    /// accessibility description when there is.
+    private let label: String
+    private let onColor: NSColor
+    /// SF Symbol names for on and off, or nil to draw `label` as text.
+    private let symbols: (on: String, off: String)?
+
+    var level: Level = .off {
+        // Only on a real change: `restyle` builds an image or an attributed
+        // string, and the status line is refreshed far more often than these
+        // actually flip.
+        didSet { if level != oldValue { restyle() } }
+    }
+
+    init(label: String, onColor: NSColor, symbols: (on: String, off: String)? = nil) {
+        self.label = label
+        self.onColor = onColor
+        self.symbols = symbols
+        super.init(frame: .zero)
+        isBordered = false
+        // Not `.momentaryPushIn`, which draws a pressed-in bezel this has no
+        // bezel to draw. Nothing visibly changes while the mouse is down; the
+        // colour change on release is the feedback.
+        setButtonType(.momentaryChange)
+        focusRingType = .none
+        // A status readout you can click is still a readout. It shouldn't be a
+        // stop on the ⇥ tour of the window — especially not here, where ⇥ in the
+        // command box is spoken for.
+        refusesFirstResponder = true
+        restyle()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("StatusToggle is code-only; it is never unarchived from a nib.")
+    }
+
+    /// The one thing that says "you can click me" before you've clicked it.
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    private func restyle() {
+        let color: NSColor
+        switch level {
+        case .off:   color = .tertiaryLabelColor
+        case .armed: color = onColor.withAlphaComponent(0.45)
+        case .on:    color = onColor
+        }
+
+        if let symbols = symbols {
+            let name = level == .off ? symbols.off : symbols.on
+            if let symbol = NSImage(systemSymbolName: name, accessibilityDescription: label) {
+                symbol.isTemplate = true
+                let sizing = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+                image = symbol.withSymbolConfiguration(sizing) ?? symbol
+                imagePosition = .imageOnly
+                contentTintColor = color
+                return
+            }
+            // No such symbol in this macOS's catalogue — fall through and draw
+            // the word instead. The toggle still works, it just reads differently.
+        }
+        imagePosition = .noImage
+        attributedTitle = NSAttributedString(string: label, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: color,
+        ])
+    }
+}
+
 /// One world's live session: scrollback text view, command input, status line,
 /// and the connection wiring. Code-only AppKit — no storyboards.
 ///
@@ -121,7 +214,11 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     private let promptLabel = NSTextField(labelWithString: "›")
 
     private let statusLabel = NSTextField(labelWithString: "Not connected")
-    private let logBadge = NSTextField(labelWithString: "LOG")
+    /// Both of these are on screen the whole time, dim when off. See
+    /// `StatusToggle` for why that's better than hiding the one that's idle.
+    private let logToggle = StatusToggle(label: "LOG", onColor: .systemGreen)
+    private let chimeToggle = StatusToggle(label: "BELL", onColor: .systemYellow,
+                                           symbols: (on: "bell.fill", off: "bell.slash"))
     private let elapsedLabel = NSTextField(labelWithString: "")
 
     private let renderer = AnsiRenderer()
@@ -171,6 +268,26 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     // Timer scheduling: next fire date per timer id.
     private var timerFireDates: [String: Date] = [:]
     private var tickTimer: Timer?
+
+    /// One word this world has used, and how long ago — see `indexWords`.
+    private struct SeenWord {
+        /// Kept as the world spelled it, so completing "bob" offers "Bob".
+        var spelling: String
+        /// A counter, not a clock. All that's wanted is an ordering, and reading
+        /// the time once per word of MUD output would be silly.
+        var lastSeen: Int
+    }
+    /// Keyed by the lowercased word, so a name shouted in caps and the same name
+    /// in a room description are one entry rather than two.
+    private var wordsSeen: [String: SeenWord] = [:]
+    private var wordClock = 0
+
+    /// The ⇥ cycle in progress, if there is one. See `completeWord`.
+    private var completion: Completion?
+    /// Raised while `showCompletion` is writing into the command box, so that
+    /// the `textDidChange` it causes doesn't read as you typing and cancel the
+    /// very cycle it's part of.
+    private var applyingCompletion = false
 
     /// The hint drawn in the empty command box. Same font as the text you type,
     /// so it sits on the same baseline and the first character you type lands
@@ -247,7 +364,26 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         textView.textContainer?.size = NSSize(width: textView.frame.width,
                                               height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
+        // How a detected URL is drawn. Deliberately no `.foregroundColor`: these
+        // are laid over whatever is in the storage, and the storage's colour is
+        // the one the *world* chose — a link in the middle of a coloured line
+        // should still be that line's colour, just underlined. The pointing hand
+        // is what actually says "this one does something".
+        textView.linkTextAttributes = [
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand,
+        ]
         scrollView.documentView = textView
+        // Lay out what's on screen instead of the whole document. The scrollback
+        // runs to a couple of hundred thousand characters, TextKit otherwise
+        // keeps glyph positions and line-fragment rectangles for every one of
+        // them, and every open tab pays that separately — which is most of the
+        // difference between this client's memory use and a modest one's. The
+        // visible cost is that the scroller thumb estimates its size until
+        // you've actually been somewhere, so it can resize slightly as you
+        // scroll back. If scrolling ever feels wrong, this line is the first
+        // thing to try taking out.
+        textView.layoutManager?.allowsNonContiguousLayout = true
 
         // --- input: a real text view, so it wraps and can be resized ---
         // Clip view first, for the same two reasons as the scrollback above.
@@ -293,15 +429,21 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
-        logBadge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
-        logBadge.textColor = .systemGreen
-        logBadge.isHidden = true
+        logToggle.target = self
+        logToggle.action = #selector(toggleLogging)
+        chimeToggle.target = self
+        chimeToggle.action = #selector(toggleChime)
 
         // Monospaced digits, or the timer jitters a pixel every second as the
         // glyph widths change under it.
         elapsedLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         elapsedLabel.textColor = .secondaryLabelColor
 
+        // The scrollback has a delegate too now, for exactly one reason: to vet
+        // a URL before the system is asked to open it. Every method on this
+        // delegate that only applies to the command box already checks which
+        // text view it was handed, so sharing one is safe.
+        textView.delegate = self
         inputView.delegate = self
         splitView.delegate = self
 
@@ -364,7 +506,7 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
 
         // `sub`, not `view` — `view` is this session's root and shadowing it
         // here would quietly add every control to itself.
-        for sub in [splitView, statusLabel, logBadge, elapsedLabel] as [NSView] {
+        for sub in [splitView, statusLabel, logToggle, chimeToggle, elapsedLabel] as [NSView] {
             sub.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(sub)
         }
@@ -372,9 +514,9 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // A long host name shouldn't shove the timer off the right edge — let
         // the status text truncate and keep the readouts pinned.
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        for label in [logBadge, elapsedLabel] {
-            label.setContentCompressionResistancePriority(.required, for: .horizontal)
-            label.setContentHuggingPriority(.required, for: .horizontal)
+        for readout in [logToggle, chimeToggle, elapsedLabel] as [NSView] {
+            readout.setContentCompressionResistancePriority(.required, for: .horizontal)
+            readout.setContentHuggingPriority(.required, for: .horizontal)
         }
         // The clock is empty until you connect. Its width is reserved below so
         // the LOG badge doesn't slide sideways the moment it starts ticking —
@@ -398,11 +540,14 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
             statusLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
 
-            logBadge.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            logBadge.leadingAnchor.constraint(greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 8),
+            logToggle.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            logToggle.leadingAnchor.constraint(greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 8),
+
+            chimeToggle.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            chimeToggle.leadingAnchor.constraint(equalTo: logToggle.trailingAnchor, constant: 10),
 
             elapsedLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            elapsedLabel.leadingAnchor.constraint(equalTo: logBadge.trailingAnchor, constant: 8),
+            elapsedLabel.leadingAnchor.constraint(equalTo: chimeToggle.trailingAnchor, constant: 10),
             elapsedLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
             elapsedLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
         ])
@@ -778,13 +923,121 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             // A gagged line stays out of the log too — if a trigger hid it from
             // you, writing it to disk anyway would be a nasty surprise.
             logLine(plain)
+            // What's on screen is what ⇥ completes from, so this is fed from the
+            // same branch that decides a line is on screen — a gagged line is
+            // one you've asked not to see, and completing to a word out of it
+            // would be the trigger leaking back.
+            indexWords(in: plain)
             // Only real lines from the world count towards the badge. Prompts
             // are excluded, or a MUD that redraws its prompt after every line
             // would double every number; system notices and your own echoed
             // commands are excluded because you already know about those.
             if !isFrontmost && !isPrompt { unread += 1 }
+            if !isPrompt { chimeIfWanted() }
         }
     }
+
+    /// Ring once for traffic you aren't watching.
+    ///
+    /// "Aren't watching" is three conditions, because there are three separate
+    /// ways for a line to land somewhere you can't see it: this might not be the
+    /// frontmost tab in its window, that window might be buried behind another
+    /// MacMUSH window or minimised into the Dock, or MacMUSH itself might be
+    /// behind another application. Only the tab you are actually reading, in the
+    /// window actually in front, stays quiet — otherwise a busy room turns the
+    /// client into an alarm clock.
+    private func chimeIfWanted() {
+        guard config.chimeEnabled, !isBeingRead else { return }
+        let now = Date()
+        // A MUD sends a room description as a dozen lines in the same instant.
+        // One sound for the burst: long enough to collapse a paragraph, short
+        // enough that two pages a few seconds apart are still two chimes. The
+        // gate is shared across worlds because the sound is — see `lastChimeAt`.
+        if let last = Session.lastChimeAt, now.timeIntervalSince(last) < 2 { return }
+        Session.lastChimeAt = now
+        if let chime = Session.chimeSound {
+            // One NSSound can't overlap itself. The throttle above is shared, so
+            // by rights it has finished — but a chime cut short by a stop() it
+            // didn't need is a worse noise than a rewind that costs nothing.
+            if chime.isPlaying { _ = chime.stop() }
+            _ = chime.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    /// Whether this session's output is in front of a pair of eyes right now.
+    ///
+    /// `isFrontmost` alone isn't enough: it only says "the active tab of my own
+    /// window", which is still true of a window sitting behind another one or
+    /// shrunk into the Dock. Miniaturised is checked explicitly because a
+    /// minimised window can still report itself visible.
+    private var isBeingRead: Bool {
+        guard isFrontmost, NSApplication.shared.isActive, let window = view.window
+        else { return false }
+        return window.isKeyWindow && window.isVisible && !window.isMiniaturized
+    }
+
+    /// When any world last chimed. Shared rather than per session, to match the
+    /// sound it guards: with a throttle per session, two chatty worlds in the
+    /// background each pass their own gate and the second one's `play()` cuts
+    /// the first one's chime off mid-ring.
+    private static var lastChimeAt: Date?
+
+    /// The chime itself, loaded once and shared by every session. "Glass" is one
+    /// of the sounds macOS ships in /System/Library/Sounds; if it has been
+    /// removed, `chimeIfWanted` falls back to the ordinary alert beep.
+    ///
+    /// `NSSound.Name(_:)` spelled out rather than a bare literal: the name type
+    /// has been both a string typealias and a struct across SDK versions, and
+    /// this spelling compiles against either.
+    private static let chimeSound = NSSound(named: NSSound.Name("Glass"))
+
+    // MARK: Word completion
+
+    /// Remember the words a line used, so ⇥ can complete from them later.
+    ///
+    /// This is the whole of the "context" MUSHClient completes against: not a
+    /// dictionary, and not a list of commands, but the names of the people,
+    /// rooms and things this particular world has been talking about. Which is
+    /// exactly what's hard to type and easy to misspell.
+    private func indexWords(in line: String) {
+        for raw in line.components(separatedBy: Session.wordSeparators) {
+            // Trim the two characters that only count as part of a word in the
+            // middle of one: the apostrophe in "the guards'" isn't part of the
+            // name, and neither is the dash in an em-dash-free "— Bob".
+            let token = raw.trimmingCharacters(in: Session.wordEdges)
+            // Under three characters completes to nothing you couldn't have
+            // typed; over forty is a URL or a line of box-drawing, not a name.
+            guard token.count >= 3, token.count <= 40 else { continue }
+            // Numbers get in the way rather than help — "300" and "3000" are
+            // never what you were reaching for.
+            guard token.contains(where: { $0.isLetter }) else { continue }
+            wordClock += 1
+            wordsSeen[token.lowercased()] = SeenWord(spelling: token, lastSeen: wordClock)
+        }
+
+        // Forgetting in bulk rather than one word per new word: a dictionary of
+        // this size is a few hundred kilobytes, and paying an O(n log n) sort
+        // once every few thousand words is cheaper than keeping a sorted
+        // structure honest on every line the world sends.
+        guard wordsSeen.count > Session.wordsRemembered else { return }
+        let keep = wordsSeen
+            .sorted { $0.value.lastSeen > $1.value.lastSeen }
+            .prefix(Session.wordsRemembered / 2)
+        wordsSeen = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+    }
+
+    /// Everything that isn't part of a word. Apostrophes, hyphens and
+    /// underscores are on the word side of the line, because "Bob's",
+    /// "half-elf" and "north_gate" are each one thing to a person.
+    private static let wordSeparators = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "_-'"))
+        .inverted
+    /// The subset of those that can't start or end a word.
+    private static let wordEdges = CharacterSet(charactersIn: "-'")
+    /// How many distinct words to keep before dropping the oldest half.
+    private static let wordsRemembered = 4000
 
     // MARK: Output helpers
 
@@ -814,9 +1067,70 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         statusLabel.stringValue = isConnected
             ? "\(config.name)  |  \(currentHost):\(currentPort)"
             : "Not connected"
-        logBadge.isHidden = !logger.isActive
-        logBadge.toolTip = logger.fileURL?.path
+
+        // Three states, not two, and the middle one is the point: full green
+        // only while a file is genuinely open. Ticked-but-not-writing — the
+        // world isn't connected yet, or the folder couldn't be written to —
+        // gets the faded green instead, so a log that quietly failed to start
+        // doesn't sit there looking exactly like one that's running.
+        logToggle.level = logger.isActive ? .on : (config.logEnabled ? .armed : .off)
+        // `isActive` as well as `fileURL`, because the logger deliberately keeps
+        // the path after it stops so the window can say where the log went. Read
+        // the URL alone and a stopped log still claims to be writing — and the
+        // tooltip would offer to "stop" a thing that clicking would start.
+        if logger.isActive, let url = logger.fileURL {
+            logToggle.toolTip = "Logging \(config.name) to \(url.path)\nClick to stop."
+        } else if config.logEnabled {
+            logToggle.toolTip = isConnected
+                ? "Logging is on, but no file is open — click twice to try again."
+                : "Logging is on. It starts writing when you connect."
+        } else {
+            logToggle.toolTip = "Not logging \(config.name). Click to start."
+        }
+
+        chimeToggle.level = config.chimeEnabled ? .on : .off
+        chimeToggle.toolTip = config.chimeEnabled
+            ? "Chiming when \(config.name) talks and you're looking elsewhere.\nClick to silence."
+            : "Silent. Click to chime when \(config.name) talks in the background."
+
         updateElapsed()
+    }
+
+    /// Start or stop logging this world, and remember which for next time.
+    @objc private func toggleLogging() {
+        config.logEnabled.toggle()
+
+        // Open and close the file here rather than leaving it to
+        // `syncActiveWorld`. That method spots a change by comparing the world
+        // arriving from the store against the one this session is holding — and
+        // this session is already holding the new value, being the thing that
+        // changed it. Saving first and reacting to the notification second would
+        // look like no change at all and quietly do nothing.
+        if isConnected {
+            if config.logEnabled { startLoggingIfEnabled() } else { stopLogging() }
+        } else {
+            // Nothing to open yet, and the badge can only go as far as its faded
+            // "armed" state — so say what just happened, or the click reads as
+            // one that didn't take.
+            appendSystem(config.logEnabled
+                ? "Logging is on for \(config.name) — it starts writing when you connect."
+                : "Logging is off for \(config.name).")
+        }
+
+        saveConfig()
+        updateStatus()
+    }
+
+    /// Turn the background chime on or off for this world. Remembered per world,
+    /// so a busy channel you want to hear about and a quiet one you don't can
+    /// each be set once and left alone.
+    @objc private func toggleChime() {
+        config.chimeEnabled.toggle()
+        saveConfig()
+        // The bell filling in or crossing out is the confirmation; no line goes
+        // into the scrollback for this one. Ticking a preference isn't something
+        // the world said, and it would be in the log forever.
+        updateStatus()
     }
 
     private func updateElapsed() {
@@ -967,10 +1281,41 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     /// `setInputText` ends in `didChangeText()`, which is what posts this.
     @objc func textDidChange(_ notification: Notification) {
         guard (notification.object as? NSTextView) === inputView else { return }
+
+        // Any edit that isn't the completion machinery writing its own result
+        // ends the ⇥ cycle. ⇥⇥⇥ walks the candidates; typing a character in the
+        // middle of that means you've settled on one and moved on.
+        if !applyingCompletion { completion = nil }
+
         let empty = inputView.string.isEmpty
         guard empty != inputWasEmpty else { return }
         inputWasEmpty = empty
         inputView.needsDisplay = true
+    }
+
+    /// Open a link clicked in the scrollback — if it's the kind of link a world
+    /// has any business sending. See `AnsiRenderer.isOpenable`.
+    ///
+    /// Returning true either way is deliberate: it stops AppKit falling back to
+    /// its own behaviour, which is to hand whatever it's got to the system.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        // AppKit hands over whatever was in the `.link` attribute. Ours are
+        // always URLs, but the attribute is documented as taking a string too.
+        let clicked: URL?
+        switch link {
+        case let value as URL:    clicked = value
+        case let value as String: clicked = URL(string: value)
+        default:                  clicked = nil
+        }
+        guard let url = clicked else { return true }
+        guard AnsiRenderer.isOpenable(url) else {
+            appendSystem("Not opening \(url.absoluteString) — MacMUSH only follows http and https links.")
+            return true
+        }
+        if !NSWorkspace.shared.open(url) {
+            appendSystem("Couldn't open \(url.absoluteString).")
+        }
+        return true
     }
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -1004,9 +1349,139 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             recallHistory(delta: 1)
             return true
 
+        case #selector(NSResponder.insertTab(_:)):
+            return completeWord(reverse: false)
+
+        case #selector(NSResponder.insertBacktab(_:)):
+            return completeWord(reverse: true)
+
         default:
             return false
         }
+    }
+
+    // MARK: ⇥ completion
+
+    /// A ⇥ cycle in progress.
+    ///
+    /// Offsets are UTF-16, because that's what `NSTextView` deals in for
+    /// selections and it's the only unit the two sides can agree on without
+    /// converting back and forth on every keystroke.
+    private struct Completion {
+        /// Where the word being completed starts.
+        let start: Int
+        /// What you actually typed, which is one of the stops on the cycle —
+        /// pressing ⇥ past the last candidate brings it back rather than
+        /// stranding you on a word you didn't choose.
+        let typed: String
+        /// Candidates, best (most recently said) first. Never contains `typed`.
+        let options: [String]
+        /// -1 means `typed` is showing; otherwise an index into `options`.
+        var index: Int
+        /// What's in the box for this word right now, so the next ⇥ can tell
+        /// whether the cycle is still standing or the text moved underneath it.
+        var shown: String
+    }
+
+    /// Complete the partial word in front of the caret from the words this world
+    /// has used, most recently said first. ⇥ again steps to the next candidate,
+    /// ⇧⇥ steps back, and going past either end returns what you typed.
+    ///
+    /// Always returns true, even with nothing to complete. The alternative is
+    /// handing ⇥ back to AppKit, which for a text view means putting a literal
+    /// tab character in the command box — which is never what was wanted here,
+    /// and would go down the socket looking like whitespace the MUD has to
+    /// guess about.
+    private func completeWord(reverse: Bool) -> Bool {
+        let text = inputView.string as NSString
+        let caret = inputView.selectedRange
+        // With a selection there's no single partial word to work from, and
+        // replacing the selection would be a surprising thing for ⇥ to do.
+        guard caret.length == 0 else { return true }
+
+        if var cycle = completion, standing(cycle, in: text, caret: caret.location) {
+            // Wrapping through -1 is what puts `typed` back at the end of the
+            // ring, in both directions.
+            var next = cycle.index + (reverse ? -1 : 1)
+            if next >= cycle.options.count { next = -1 }
+            if next < -1 { next = cycle.options.count - 1 }
+            cycle.index = next
+            showCompletion(cycle)
+            return true
+        }
+
+        // Fresh start: the word being typed runs from just after the last
+        // separator before the caret, up to the caret itself.
+        let before = NSRange(location: 0, length: caret.location)
+        let lastBreak = text.rangeOfCharacter(from: Session.wordSeparators,
+                                              options: .backwards, range: before)
+        let start = lastBreak.location == NSNotFound ? 0 : lastBreak.location + lastBreak.length
+        guard start < caret.location else { return true }
+        let typed = text.substring(with: NSRange(location: start, length: caret.location - start))
+
+        let lowered = typed.lowercased()
+        let options = wordsSeen.values
+            // `!= typed` rather than a case-insensitive comparison: if you typed
+            // "bob" and the world says "Bob", offering the world's spelling is
+            // the most useful thing ⇥ can do.
+            .filter { $0.spelling != typed && $0.spelling.lowercased().hasPrefix(lowered) }
+            .sorted { $0.lastSeen > $1.lastSeen }
+            // Nobody cycles past a couple of dozen. The cap keeps a two-letter
+            // prefix in a chatty world from building a thousand-entry ring.
+            .prefix(40)
+            .map { $0.spelling }
+        guard !options.isEmpty else { return true }
+
+        showCompletion(Completion(start: start,
+                                  typed: typed,
+                                  options: options,
+                                  index: reverse ? options.count - 1 : 0,
+                                  shown: typed))
+        return true
+    }
+
+    /// Whether a cycle still describes what's in the command box.
+    ///
+    /// The caret can move without anything changing — arrow keys and clicks post
+    /// no `textDidChange` — so the cycle can't rely on being told when it stops
+    /// applying. It checks instead.
+    private func standing(_ cycle: Completion, in text: NSString, caret: Int) -> Bool {
+        let length = (cycle.shown as NSString).length
+        guard cycle.start >= 0,
+              cycle.start + length <= text.length,
+              cycle.start + length == caret else { return false }
+        return text.substring(with: NSRange(location: cycle.start, length: length)) == cycle.shown
+    }
+
+    /// Put a cycle's current candidate in the box and leave the caret after it.
+    private func showCompletion(_ cycle: Completion) {
+        let replacement = cycle.index < 0 ? cycle.typed : cycle.options[cycle.index]
+        let range = NSRange(location: cycle.start, length: (cycle.shown as NSString).length)
+        // The same dance as `setInputText`, and for the same reason: going
+        // straight at the storage without bracketing leaves the undo manager
+        // holding ranges that no longer exist.
+        guard inputView.shouldChangeText(in: range, replacementString: replacement) else { return }
+
+        applyingCompletion = true
+        inputView.textStorage?.replaceCharacters(in: range, with: replacement)
+        let placed = NSRange(location: cycle.start, length: (replacement as NSString).length)
+        // A storage-level replace doesn't pick up typing attributes, so without
+        // this the completed word comes back in the system font.
+        inputView.textStorage?.setAttributes(inputView.typingAttributes, range: placed)
+        inputView.didChangeText()
+        applyingCompletion = false
+
+        // Property, not `setSelectedRange(_:)` — that pair imports into Swift as
+        // a settable property, the same way `recallHistory` sets it.
+        let caret = NSRange(location: placed.upperBound, length: 0)
+        inputView.selectedRange = caret
+        // A long pose can have pushed the word being completed off the top of
+        // the command box.
+        inputView.scrollRangeToVisible(caret)
+
+        var updated = cycle
+        updated.shown = replacement
+        completion = updated
     }
 
     // MARK: Timers

@@ -18,6 +18,7 @@ public struct WorldConfig: Codable, Equatable, Sendable {
     public var timers: [MudTimer]
     public var logEnabled: Bool            // write a session log while connected
     public var logDirectory: String        // "" means the per-world default folder
+    public var chimeEnabled: Bool          // sound when this world talks in the background
 
     public init(id: String = UUID().uuidString,
                 name: String = "My World",
@@ -28,7 +29,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
                 aliases: [MatchRule] = [],
                 timers: [MudTimer] = [],
                 logEnabled: Bool = false,
-                logDirectory: String = "") {
+                logDirectory: String = "",
+                chimeEnabled: Bool = false) {
         self.id = id
         self.name = name
         self.host = host
@@ -39,11 +41,12 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.timers = timers
         self.logEnabled = logEnabled
         self.logDirectory = logDirectory
+        self.chimeEnabled = chimeEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, host, port, connectText, triggers, aliases, timers
-        case logEnabled, logDirectory
+        case logEnabled, logDirectory, chimeEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,6 +61,9 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.timers = try c.decodeIfPresent([MudTimer].self, forKey: .timers) ?? []
         self.logEnabled = try c.decodeIfPresent(Bool.self, forKey: .logEnabled) ?? false
         self.logDirectory = try c.decodeIfPresent(String.self, forKey: .logDirectory) ?? ""
+        // Absent from every world file written before the chime existed, hence
+        // `decodeIfPresent` like the rest — off is the right default anyway.
+        self.chimeEnabled = try c.decodeIfPresent(Bool.self, forKey: .chimeEnabled) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -72,5 +78,6 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         try c.encode(timers, forKey: .timers)
         try c.encode(logEnabled, forKey: .logEnabled)
         try c.encode(logDirectory, forKey: .logDirectory)
+        try c.encode(chimeEnabled, forKey: .chimeEnabled)
     }
 }

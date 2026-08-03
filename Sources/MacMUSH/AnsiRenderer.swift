@@ -14,8 +14,25 @@ final class AnsiRenderer {
     let defaultForeground = Theme.foreground
     let background = Theme.scrollback
 
-    private let maxLength = 600_000
-    private let trimTo = 500_000
+    /// How much scrollback to keep, in characters, and how far back to cut when
+    /// there's more than that.
+    ///
+    /// Roughly three thousand lines of an eighty-column world, which is a long
+    /// evening's play. It used to be two and a half times this, and that turned
+    /// out to be expensive in a way the raw character count hides: the text
+    /// system keeps glyph positions and line-fragment rectangles for everything
+    /// it has laid out, which is several times the size of the text itself, and
+    /// every open tab pays it separately. Scroll back further than this and the
+    /// session log is the place to look — that keeps everything.
+    private let maxLength = 240_000
+    private let trimTo = 200_000
+
+    /// Built once and shared. `NSDataDetector` compiles a fair-sized rule set on
+    /// creation and `append` runs on every line the world sends, so this is not
+    /// a thing to make per call. Optional only because the initialiser is
+    /// throwing; there is no input here for it to fail on.
+    private static let linkDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue)
 
     func append(_ ops: [AnsiOp], to textView: NSTextView) {
         guard let storage = textView.textStorage else { return }
@@ -30,6 +47,7 @@ final class AnsiRenderer {
                 result.append(attributed(styled))
             }
         }
+        AnsiRenderer.linkify(result)
         storage.append(result)
 
         if storage.length > maxLength {
@@ -39,10 +57,59 @@ final class AnsiRenderer {
 
     /// Render a plain client message (notes, connection status) in one colour.
     func systemLine(_ text: String, color: NSColor) -> NSAttributedString {
-        NSAttributedString(string: text, attributes: [
+        let line = NSMutableAttributedString(string: text, attributes: [
             .font: font,
             .foregroundColor: color,
         ])
+        // Client messages carry URLs about as often as the world does — someone
+        // pastes one into a channel and it comes back through the echo — and a
+        // link that works in one half of the scrollback but not the other is
+        // worse than no links at all.
+        AnsiRenderer.linkify(line)
+        return line
+    }
+
+    /// Attach a URL to anything in `text` that looks like one, so the text view
+    /// will open it on click.
+    ///
+    /// Called with a single line at a time, which is what makes this affordable:
+    /// the detector never sees the whole scrollback, only the few dozen
+    /// characters that just arrived.
+    static func linkify(_ text: NSMutableAttributedString) {
+        let string = text.string
+        // Cheap gate first, because the overwhelming majority of MUD output
+        // contains nothing resembling a URL and the detector is a regex engine
+        // over a dozen-odd rules. "://" catches every scheme whatever its case,
+        // and "www." is the one common form that leaves the scheme out.
+        guard string.contains("://")
+                || string.range(of: "www.", options: .caseInsensitive) != nil,
+              let detector = linkDetector else { return }
+
+        let whole = NSRange(location: 0, length: (string as NSString).length)
+        detector.enumerateMatches(in: string, options: [], range: whole) { match, _, _ in
+            guard let url = match?.url, let range = match?.range,
+                  AnsiRenderer.isOpenable(url) else { return }
+            // The underline is here in the storage, rather than left to the text
+            // view's `linkTextAttributes`, so that text dragged or copied out of
+            // the scrollback still arrives somewhere else looking like a link.
+            text.addAttributes([.link: url,
+                                .underlineStyle: NSUnderlineStyle.single.rawValue],
+                               range: range)
+        }
+    }
+
+    /// Whether MacMUSH will hand this URL to the system.
+    ///
+    /// The text these come out of is whatever a server chose to print, and
+    /// `NSDataDetector` is happy to build a `file://` or `ftp://` URL out of it.
+    /// Opening one of those on a stranger's say-so is how a hostile world gets
+    /// to reach into this machine, so "a page on the web" is the whole of what's
+    /// allowed and everything else is left inert.
+    static func isOpenable(_ url: URL) -> Bool {
+        switch url.scheme?.lowercased() {
+        case "http", "https": return true
+        default: return false
+        }
     }
 
     private func attributed(_ styled: StyledText) -> NSAttributedString {
