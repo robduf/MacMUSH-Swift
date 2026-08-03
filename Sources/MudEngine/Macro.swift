@@ -64,6 +64,38 @@ public struct KeyShortcut: Equatable, Codable, Sendable {
     }
 }
 
+/// The colour a macro's button is painted.
+///
+/// A fixed set rather than a free-form colour, so the shades can be chosen once
+/// to stay readable against both a light and a dark palette, and so the label on
+/// top can be black or white to suit without asking anyone to think about it.
+///
+/// The case is named `plain` rather than `none` on purpose. `none` is also
+/// `Optional`'s case, and `MacroColor(rawValue: x) ?? .none` is genuinely
+/// ambiguous — the compiler can read that `.none` as an empty optional and hand
+/// back the wrong type. `plain` has no such twin.
+///
+/// The actual shades live on the app side; the engine has no AppKit and does not
+/// need one.
+public enum MacroColor: String, Codable, Sendable, CaseIterable {
+    case plain, red, orange, yellow, green, teal, blue, purple, pink
+
+    /// What the menu item says.
+    public var displayName: String {
+        switch self {
+        case .plain:  return "None"
+        case .red:    return "Red"
+        case .orange: return "Orange"
+        case .yellow: return "Yellow"
+        case .green:  return "Green"
+        case .teal:   return "Teal"
+        case .blue:   return "Blue"
+        case .purple: return "Purple"
+        case .pink:   return "Pink"
+        }
+    }
+}
+
 /// A single button in the macro palette.
 public struct Macro: Equatable, Codable, Sendable {
     public var id: String
@@ -78,17 +110,21 @@ public struct Macro: Equatable, Codable, Sendable {
     public var sendImmediately: Bool
     /// nil means the button is the only way to reach it.
     public var shortcut: KeyShortcut?
+    /// What colour to paint the button. `.plain` leaves it the standard grey.
+    public var color: MacroColor
 
     public init(id: String = UUID().uuidString,
                 label: String = "",
                 sendText: String = "",
                 sendImmediately: Bool = true,
-                shortcut: KeyShortcut? = nil) {
+                shortcut: KeyShortcut? = nil,
+                color: MacroColor = .plain) {
         self.id = id
         self.label = label
         self.sendText = sendText
         self.sendImmediately = sendImmediately
         self.shortcut = shortcut
+        self.color = color
     }
 
     /// What to actually draw on the button.
@@ -103,7 +139,7 @@ public struct Macro: Equatable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, sendText, sendImmediately, shortcut
+        case id, label, sendText, sendImmediately, shortcut, color
     }
 
     public init(from decoder: Decoder) throws {
@@ -113,5 +149,18 @@ public struct Macro: Equatable, Codable, Sendable {
         self.sendText = try c.decodeIfPresent(String.self, forKey: .sendText) ?? ""
         self.sendImmediately = try c.decodeIfPresent(Bool.self, forKey: .sendImmediately) ?? true
         self.shortcut = try c.decodeIfPresent(KeyShortcut.self, forKey: .shortcut)
+        // Decoded as a string and then looked up, rather than as `MacroColor`
+        // directly. Asking for the enum makes an unrecognised name *throw*, and a
+        // throw here loses the whole world — every trigger, alias and timer in it
+        // — over one unknown colour. This way a name from a newer build, or a
+        // typo in a hand-edited file, costs you the colour and nothing else.
+        //
+        // `try?` rather than `decodeIfPresent` for the same reason again:
+        // `decodeIfPresent` answers nil for a missing key but still *throws* on a
+        // value of the wrong type, and a number where the name should be is
+        // exactly the sort of thing hand-editing produces. This way missing,
+        // null, and wrong-typed all arrive as nil and all mean uncoloured.
+        let name: String? = try? c.decode(String.self, forKey: .color)
+        self.color = MacroColor(rawValue: name ?? "") ?? .plain
     }
 }

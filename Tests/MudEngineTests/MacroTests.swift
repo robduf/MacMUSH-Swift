@@ -112,6 +112,85 @@ final class MacroTests {
         XCTAssertEqual(decoded.shortcut?.label, "")
     }
 
+    // MARK: Colour
+
+    func testColorRoundTrip() throws {
+        let macro = Macro(label: "Who", sendText: "+who", color: .teal)
+
+        let decoded = try JSONDecoder().decode(
+            Macro.self, from: try JSONEncoder().encode(macro))
+
+        XCTAssertEqual(decoded.color, .teal)
+        XCTAssertEqual(decoded, macro)
+    }
+
+    /// Every macro written before the colour existed has no `color` key, and all
+    /// of them have to keep loading — as uncoloured, which is what they looked
+    /// like when they were saved.
+    func testAbsentColorDecodesAsPlain() throws {
+        let json = """
+        { "label": "Who", "sendText": "+who" }
+        """.data(using: .utf8)!
+
+        XCTAssertEqual(try JSONDecoder().decode(Macro.self, from: json).color, .plain)
+    }
+
+    /// The reason `color` is decoded as a string and then looked up, rather than
+    /// asked for as a `MacroColor`: asking for the enum makes an unrecognised
+    /// name *throw*, and a throw in a macro takes the whole world file with it —
+    /// every trigger, alias and timer in it — over one unknown colour. A name
+    /// from a newer build, or a typo in a hand-edited file, must cost the colour
+    /// and nothing else.
+    func testUnknownColorNameDecodesAsPlainRatherThanThrowing() throws {
+        let json = """
+        { "label": "Who", "sendText": "+who", "color": "chartreuse" }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder().decode(Macro.self, from: json)
+
+        XCTAssertEqual(decoded.color, .plain)
+        XCTAssertEqual(decoded.label, "Who")     // the rest of the macro survived
+        XCTAssertEqual(decoded.sendText, "+who")
+    }
+
+    /// A colour wrong-typed on disk is the same problem as an unknown name, and
+    /// gets the same answer. `decodeIfPresent` throws on a type mismatch too.
+    func testNonStringColorDecodesAsPlainRatherThanThrowing() throws {
+        let json = """
+        { "label": "Who", "sendText": "+who", "color": 3 }
+        """.data(using: .utf8)!
+
+        XCTAssertEqual(try JSONDecoder().decode(Macro.self, from: json).color, .plain)
+    }
+
+    /// These raw values are the on-disk format, not an implementation detail.
+    /// Rename a case and every world file saved before the rename quietly loses
+    /// its colours — the lenient decode above is exactly what would hide it.
+    func testColorNamesAreStableOnDisk() {
+        XCTAssertEqual(MacroColor.allCases.map { $0.rawValue },
+                       ["plain", "red", "orange", "yellow",
+                        "green", "teal", "blue", "purple", "pink"])
+    }
+
+    /// `allCases` is what builds the Settings popup, and both directions of that
+    /// menu are index arithmetic against this array: the row's colour is found
+    /// by `firstIndex(of:)`, and a pick comes back as `allCases[index]`. The
+    /// lookup falls back to item 0 when it finds nothing, so item 0 has to be
+    /// the harmless one.
+    func testPlainIsTheFirstColor() {
+        XCTAssertEqual(MacroColor.allCases.first, .plain)
+        XCTAssertEqual(Macro().color, .plain)
+    }
+
+    /// Nine menu items, nine captions, none of them blank.
+    func testEveryColorHasADisplayName() {
+        XCTAssertEqual(MacroColor.allCases.count, 9)
+        for color in MacroColor.allCases {
+            XCTAssertFalse(color.displayName.isEmpty)
+        }
+        XCTAssertEqual(MacroColor.plain.displayName, "None")
+    }
+
     // MARK: Matching
 
     func testShortcutMatchesOnKeyCodeAndModifiers() {
@@ -166,6 +245,13 @@ extension MacroTests {
         ("testAbsentShortcutStaysAbsent", { try MacroTests().testAbsentShortcutStaysAbsent() }),
         ("testLenientDecodeOfPartialJSON", { try MacroTests().testLenientDecodeOfPartialJSON() }),
         ("testLenientDecodeOfPartialShortcutJSON", { try MacroTests().testLenientDecodeOfPartialShortcutJSON() }),
+        ("testColorRoundTrip", { try MacroTests().testColorRoundTrip() }),
+        ("testAbsentColorDecodesAsPlain", { try MacroTests().testAbsentColorDecodesAsPlain() }),
+        ("testUnknownColorNameDecodesAsPlainRatherThanThrowing", { try MacroTests().testUnknownColorNameDecodesAsPlainRatherThanThrowing() }),
+        ("testNonStringColorDecodesAsPlainRatherThanThrowing", { try MacroTests().testNonStringColorDecodesAsPlainRatherThanThrowing() }),
+        ("testColorNamesAreStableOnDisk", { MacroTests().testColorNamesAreStableOnDisk() }),
+        ("testPlainIsTheFirstColor", { MacroTests().testPlainIsTheFirstColor() }),
+        ("testEveryColorHasADisplayName", { MacroTests().testEveryColorHasADisplayName() }),
         ("testShortcutMatchesOnKeyCodeAndModifiers", { MacroTests().testShortcutMatchesOnKeyCodeAndModifiers() }),
         ("testShortcutRejectsExtraModifiers", { MacroTests().testShortcutRejectsExtraModifiers() }),
         ("testShortcutMatchingIgnoresTheLabel", { MacroTests().testShortcutMatchingIgnoresTheLabel() }),

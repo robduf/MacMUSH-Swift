@@ -210,6 +210,36 @@ final class WorldWindow: NSObject, NSWindowDelegate {
         }
     }
 
+    /// Whether moving between tabs would go anywhere. Asked by the Window menu,
+    /// which greys its Next / Previous items out when it wouldn't — and asked as
+    /// this rather than by counting `sessions` from outside, so the one place
+    /// that knows how many tabs there are is still the one that says.
+    var hasMultipleTabs: Bool { sessions.count > 1 }
+
+    /// ⌃⇥ — the tab to the right, wrapping round to the first from the last.
+    func selectNextTab() {
+        selectAdjacentTab(by: 1)
+    }
+
+    /// ⌃⇧⇥ — the tab to the left, wrapping round to the last from the first.
+    func selectPreviousTab() {
+        selectAdjacentTab(by: -1)
+    }
+
+    /// The arithmetic lives here, beside the array it indexes, rather than in
+    /// the menu action. `sessions` and `activeIndex` are this window's own
+    /// business; handing them out so a caller could add one to an index would
+    /// make every caller responsible for the wrap.
+    private func selectAdjacentTab(by offset: Int) {
+        let count = sessions.count
+        // With one tab you're already on it, and re-selecting would tear the
+        // session view down and build it back for no visible change.
+        guard count > 1 else { return }
+        // `+ count` before the remainder because Swift's `%` keeps the sign of
+        // the left-hand side: -1 % 3 is -1, not 2, and there is no such index.
+        selectTab(at: (activeIndex + offset + count) % count)
+    }
+
     /// The index of the tab showing a given world, if this window has one.
     func indexOfTab(worldID: String) -> Int? {
         sessions.firstIndex { $0.worldID == worldID }

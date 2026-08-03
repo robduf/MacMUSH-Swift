@@ -261,10 +261,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             // and one you want gone has a − button right below the table. The
             // other three kinds fire on their own, which is what makes a way to
             // silence them without deleting them worth a column.
-            addColumn(table, "label", "Button", width: 120)
+            addColumn(table, "label", "Button", width: 110)
             addColumn(table, "now", "Now", width: 40, minWidth: 40)
-            addColumn(table, "key", "Key", width: 90, minWidth: 70)
-            addColumn(table, "send", "Send", width: 250)
+            addColumn(table, "color", "Color", width: 84, minWidth: 74)
+            addColumn(table, "key", "Key", width: 86, minWidth: 70)
+            addColumn(table, "send", "Send", width: 210)
         }
         table.rowHeight = 22
         table.usesAlternatingRowBackgroundColors = true
@@ -612,6 +613,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             case "label": return textCell(tableView, identifier: identifier, value: macro.label)
             case "send": return textCell(tableView, identifier: identifier, value: macro.sendText)
             case "now": return checkCell(tableView, identifier: identifier, on: macro.sendImmediately)
+            case "color": return colorCell(tableView, identifier: identifier, color: macro.color)
             case "key": return shortcutCell(tableView, identifier: identifier, shortcut: macro.shortcut)
             default: return nil
             }
@@ -677,6 +679,44 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         }
         recorder.shortcut = shortcut
         return recorder
+    }
+
+    /// The Color column: a swatch per preset, and None at the top.
+    ///
+    /// The menu is built once, when the view is first made, and then reused — the
+    /// list can't change, and rebuilding it on every scroll would redraw nine
+    /// images for nothing.
+    private func colorCell(_ table: NSTableView, identifier: String,
+                           color: MacroColor) -> NSPopUpButton {
+        let id = NSUserInterfaceItemIdentifier(identifier)
+        let popup: NSPopUpButton
+        if let reused = table.makeView(withIdentifier: id, owner: self) as? NSPopUpButton {
+            popup = reused
+        } else {
+            popup = NSPopUpButton(frame: .zero, pullsDown: false)
+            popup.identifier = id
+            popup.target = self
+            popup.action = #selector(colorPicked(_:))
+            popup.controlSize = .small
+            popup.font = NSFont.systemFont(ofSize: 11)
+
+            // A menu built here and assigned, rather than items appended to
+            // `popup.menu`. That property is an optional inherited from NSView,
+            // and `popup.menu?.addItem(…)` on a nil one does nothing at all,
+            // quietly, leaving an empty popup and no clue why.
+            let menu = NSMenu()
+            for swatch in MacroColor.allCases {
+                let item = NSMenuItem(title: swatch.displayName,
+                                      action: nil, keyEquivalent: "")
+                item.image = swatch.swatchImage
+                menu.addItem(item)
+            }
+            popup.menu = menu
+        }
+        // Position in `allCases` is the index in the menu, because that array is
+        // what built it. Declaration order, and stable.
+        popup.selectItem(at: MacroColor.allCases.firstIndex(of: color) ?? 0)
+        return popup
     }
 
     private func checkCell(_ table: NSTableView, identifier: String, on: Bool) -> NSButton {
@@ -942,6 +982,29 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     }
 
     // MARK: Macros
+
+    /// A colour was chosen in the Color column.
+    @objc private func colorPicked(_ sender: NSPopUpButton) {
+        // Both read before `endEditing`, for the same reason `shortcutRecorded`
+        // does it: committing a pending edit can rebuild the table, and this view
+        // is then no longer in it — `row(for:)` would answer -1 and the selection
+        // would be read off a popup that has since been handed to another row.
+        let row = macrosTable.row(for: sender)
+        let index = sender.indexOfSelectedItem
+
+        // A popup doesn't take first responder, so a cell being typed into right
+        // now still has its editor open. Flush it before `worlds` is read, or the
+        // pre-edit text gets written back over what was typed.
+        endEditing()
+
+        guard let i = editingIndex, row >= 0, row < worlds[i].macros.count else { return }
+        guard index >= 0, index < MacroColor.allCases.count else { return }
+
+        let picked = MacroColor.allCases[index]
+        guard worlds[i].macros[row].color != picked else { return }
+        worlds[i].macros[row].color = picked
+        commitWorld(at: i)
+    }
 
     /// A key was recorded — or cleared — in the Key column.
     ///

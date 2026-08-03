@@ -2,6 +2,85 @@
 import AppKit
 import MudEngine
 
+// MARK: - Swatches
+
+/// The shades a macro can be painted, and the label colour that reads on top of
+/// each one.
+///
+/// Here rather than in the engine, because these are AppKit colours and the
+/// engine has no AppKit — it carries the *name* of the colour and nothing else.
+///
+/// Held as literal components rather than pulled back out of an `NSColor`:
+/// `redComponent` and its siblings trap on a colour that isn't in an RGB space,
+/// and there is no reason to go near that when the numbers are right here.
+extension MacroColor {
+
+    private var components: (r: CGFloat, g: CGFloat, b: CGFloat)? {
+        switch self {
+        case .plain:  return nil
+        case .red:    return (0.78, 0.25, 0.24)
+        case .orange: return (0.85, 0.49, 0.15)
+        case .yellow: return (0.92, 0.78, 0.20)
+        case .green:  return (0.28, 0.60, 0.31)
+        case .teal:   return (0.15, 0.58, 0.60)
+        case .blue:   return (0.24, 0.46, 0.82)
+        case .purple: return (0.50, 0.34, 0.74)
+        case .pink:   return (0.84, 0.38, 0.58)
+        }
+    }
+
+    /// What the button is painted. `.plain` gets the standard control grey, which
+    /// is a dynamic colour and so follows light and dark mode by itself.
+    var fillColor: NSColor {
+        guard let c = components else { return .controlColor }
+        return NSColor(srgbRed: c.r, green: c.g, blue: c.b, alpha: 1)
+    }
+
+    /// Black on the pale shades, white on the rest.
+    ///
+    /// The weights are the usual perceptual ones: green carries most of what the
+    /// eye reads as brightness and blue almost none, which is why a saturated
+    /// blue counts as dark here even though its numbers aren't small. On this set
+    /// only yellow comes out light enough to want black on it.
+    private var wantsDarkTitle: Bool {
+        guard let c = components else { return false }
+        return 0.299 * c.r + 0.587 * c.g + 0.114 * c.b > 0.6
+    }
+
+    /// The macro's name.
+    var titleColor: NSColor {
+        guard components != nil else { return .labelColor }
+        return wantsDarkTitle ? .black : .white
+    }
+
+    /// The key caption, a step quieter than the name. On a coloured button the
+    /// standard tertiary grey all but vanishes, so it's the title colour faded
+    /// instead — which keeps its contrast with the fill underneath.
+    var keyColor: NSColor {
+        guard components != nil else { return .tertiaryLabelColor }
+        return titleColor.withAlphaComponent(0.7)
+    }
+
+    /// A small rounded chip for the Settings popup.
+    var swatchImage: NSImage {
+        // The handler is kept and re-run each time the image is drawn, so the
+        // dynamic colour behind `.plain` resolves against the appearance in force
+        // then rather than the one that happened to be up when this was built.
+        NSImage(size: NSSize(width: 24, height: 12), flipped: false) { rect in
+            let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                                    xRadius: 3, yRadius: 3)
+            self.fillColor.setFill()
+            path.fill()
+            path.lineWidth = 1
+            NSColor.separatorColor.setStroke()
+            path.stroke()
+            return true
+        }
+    }
+}
+
+// MARK: - Buttons
+
 /// A button that remembers which macro it stands for.
 ///
 /// The alternative is `tag` holding an index into an array, which is fine right
@@ -15,6 +94,44 @@ import MudEngine
 /// waiting to happen.
 private final class MacroButton: NSButton {
     var macro: Macro?
+
+    /// Set once, when the button is built, so the drawing has nothing to unwrap
+    /// and no optional to have an opinion about.
+    var fillColor: NSColor = .controlColor
+
+    override func draw(_ dirtyRect: NSRect) {
+        // Drawn here rather than set as a layer background. A layer colour is
+        // resolved once, against whatever appearance was in force when it was
+        // assigned, so the grey on a plain button would stay a dark-mode grey
+        // after a switch to light. `draw` runs under the current appearance every
+        // time it is called.
+        let path = NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5)
+        // The press state is *read* from the cell rather than tracked here. The
+        // cell already follows the pointer for the whole gesture — press, drag
+        // off to cancel, drag back to re-arm — and marks this view dirty each
+        // time it flips, which is how every stock button repaints on a click.
+        //
+        // Tracking it by hand instead, around `mouseDown`, is the version that
+        // looks right and isn't: `mouseDown` doesn't return until mouse-up, so
+        // the fill would stay dark through a drag-off and disagree with the
+        // title, which the cell dims correctly. And the action is sent from
+        // inside that loop, where a rebuild of the palette can remove this very
+        // button from its superview — leaving the two lines after `super` to
+        // touch a view that has been let go of.
+        //
+        // `blended(withFraction:of:)` answers nil when two colours have no common
+        // space to meet in, which a dynamic catalog colour can manage. Then the
+        // press simply doesn't darken — a good deal better than not drawing.
+        let fill = isHighlighted
+            ? (fillColor.blended(withFraction: 0.22, of: .black) ?? fillColor)
+            : fillColor
+        fill.setFill()
+        path.fill()
+
+        // Then the cell, for the title. `isBordered` is off, so there is no bezel
+        // to paint back over what was just filled.
+        super.draw(dirtyRect)
+    }
 }
 
 /// The palette's scrolling contents. Flipped so the first macro is at the top
@@ -193,35 +310,48 @@ final class MacroPalette: NSObject {
         layoutButtons(macros)
     }
 
+    /// Explicit, rather than whatever `sizeToFit` says.
+    ///
+    /// A rounded push button reserves a few points above and below the artwork it
+    /// actually draws, and `sizeToFit` reports the frame including that padding.
+    /// Stack a few and the visible gap comes out half again the number the code
+    /// asks for, with no sign in the code of where the rest came from. Drawing
+    /// the bezel ourselves means the frame *is* the button, and the gap below is
+    /// the gap you see.
+    private static let buttonHeight: CGFloat = 22
+    private static let buttonGap: CGFloat = 4
+    private static let margin: CGFloat = 8
+
     private func layoutButtons(_ macros: [Macro]) {
-        let width = max(80, scroll.contentSize.width - 20)
-        var y: CGFloat = 10
+        let margin = MacroPalette.margin
+        let height = MacroPalette.buttonHeight
+        let gap = MacroPalette.buttonGap
+        let width = max(80, scroll.contentSize.width - margin * 2)
+        var y = margin
 
         for macro in macros {
-            let button = MacroButton(frame: .zero)
+            let button = MacroButton(
+                frame: NSRect(x: margin, y: y, width: width, height: height))
             button.macro = macro
-            button.bezelStyle = .rounded
+            button.fillColor = macro.color.fillColor
+            // No bezel: it would paint over the colour underneath it, and its
+            // padding is what put the extra air between the buttons.
+            button.isBordered = false
             button.setButtonType(.momentaryPushIn)
-            button.controlSize = .small
+            button.focusRingType = .none
             button.attributedTitle = MacroPalette.buttonTitle(for: macro)
             button.toolTip = MacroPalette.tooltip(for: macro)
             button.target = self
             button.action = #selector(macroClicked(_:))
-            // Height from the bezel rather than a number picked here: a rounded
-            // push button has one it draws properly at, and forcing a different
-            // one leaves the artwork floating in the middle of the frame.
-            button.sizeToFit()
-            let height = max(20, button.frame.height)
-
-            button.frame = NSRect(x: 10, y: y, width: width, height: height)
             button.autoresizingMask = [.width]
             list.addSubview(button)
-            y += height + 6
+            y += height + gap
         }
 
-        // The 6pt trailing the last button is the bottom margin; 4 more makes it
-        // match the 10 at the top.
-        list.frame = NSRect(x: 0, y: 0, width: scroll.contentSize.width, height: y + 4)
+        // `y` is now one gap past the last button's bottom edge. That gap becomes
+        // part of the bottom margin, so take it off and add the real one.
+        list.frame = NSRect(x: 0, y: 0, width: scroll.contentSize.width,
+                            height: y - gap + margin)
     }
 
     /// Two different nothings: no world open at all, and a world with no macros
@@ -291,6 +421,13 @@ final class MacroPalette: NSObject {
         // A macro named after a long command has to lose its tail somewhere, and
         // the front of it is the part that identifies it.
         style.lineBreakMode = .byTruncatingTail
+        // The cell hands the title the whole button to draw in, so the breathing
+        // room has to come from the paragraph rather than from a smaller frame.
+        // A negative tail indent is measured back from the trailing edge, which
+        // is what keeps a truncated name from running into the right-hand side.
+        style.firstLineHeadIndent = 8
+        style.headIndent = 8
+        style.tailIndent = -8
 
         // "…" is what it means everywhere else on the Mac: this doesn't act yet,
         // it asks you something first. Here the something is the rest of the
@@ -299,14 +436,14 @@ final class MacroPalette: NSObject {
 
         let title = NSMutableAttributedString(string: name, attributes: [
             .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: macro.color.titleColor,
             .paragraphStyle: style,
         ])
 
         if let shortcut = macro.shortcut, !shortcut.label.isEmpty {
             title.append(NSAttributedString(string: "   " + shortcut.label, attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.tertiaryLabelColor,
+                .foregroundColor: macro.color.keyColor,
                 .paragraphStyle: style,
             ]))
         }

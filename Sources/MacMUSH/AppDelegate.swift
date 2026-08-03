@@ -7,14 +7,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var worldsMenu: NSMenu?
     /// Built the first time ⌘K is pressed and kept for the life of the app.
     private var macroPalette: MacroPalette?
-    /// The macro key dispatcher. Held so it's installed exactly once; it is
-    /// never removed, because it lives as long as the app does.
-    private var macroKeyMonitor: Any?
+    /// The key dispatcher for macros and tab navigation. Held so it's installed
+    /// exactly once; it is never removed, because it lives as long as the app.
+    private var keyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Before `buildMenu`, because this is what stops AppKit adding its own
+        // tab items to whatever menu becomes `NSApp.windowsMenu` — including a
+        // "Show Next Tab" on ⌃⇥ and a "Show Previous Tab" on ⌃⇧⇥, which are the
+        // two this app is about to claim for its own tab bar. It also stops the
+        // system merging world windows into native tabs, which would put a
+        // second row of tabs above the one `TabBarView` draws.
+        NSWindow.allowsAutomaticWindowTabbing = false
         buildMenu()
-        installMacroKeyMonitor()
+        installKeyMonitor()
 
         WindowManager.shared.openInitialWindow()
 
@@ -133,6 +140,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                                             keyEquivalent: "k")
         macrosItem.target = self
         windowMenu.addItem(.separator())
+
+        // ⌃⇥ and ⌃⇧⇥, the pair Safari and Chrome already use for this.
+        //
+        // Not bare ⇥ or ⇧⇥: the command box has both, for completing a word from
+        // what's on screen. And not ⌘1…⌘9 either — the Worlds menu holds those,
+        // and they mean a different thing anyway (a named *world*, wherever its
+        // tab happens to be, rather than a position in this window).
+        //
+        // These are the captions. The key presses themselves are caught by the
+        // monitor in `installKeyMonitor`, which matches the physical key code;
+        // see there for why that's the reliable half of this.
+        //
+        // The two key equivalents are spelled differently on purpose. A menu
+        // matches its equivalent against `charactersIgnoringModifiers`, and that
+        // property keeps shift — so ⌃⇧⇥ arrives as back tab, U+0019, and never
+        // as a tab. Give both items "\t" and the second one is a caption with a
+        // dead key behind it.
+        //
+        // Which means the second item is likely drawn "⌃⇧⇤" rather than "⌃⇧⇥",
+        // since ⇤ is the glyph for back tab — the same one `ShortcutFormat` uses
+        // for it. Redundant, because ⇤ already says shift, but it is the honest
+        // spelling of the key that actually fires.
+        let nextTabItem = windowMenu.addItem(withTitle: "Next Tab",
+                                             action: #selector(nextTab),
+                                             keyEquivalent: "\t")
+        nextTabItem.keyEquivalentModifierMask = [.control]
+        nextTabItem.target = self
+        let previousTabItem = windowMenu.addItem(withTitle: "Previous Tab",
+                                                 action: #selector(previousTab),
+                                                 keyEquivalent: "\u{19}")
+        previousTabItem.keyEquivalentModifierMask = [.control, .shift]
+        previousTabItem.target = self
+
+        windowMenu.addItem(.separator())
         NSApp.windowsMenu = windowMenu
 
         NSApp.mainMenu = mainMenu
@@ -173,12 +214,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         WindowManager.shared.syncAll()
     }
 
-    /// Ticks the Macros item while the palette is up. Everything else targeted
-    /// at this object stays enabled, which is what AppKit was already doing
-    /// before this method existed.
+    /// Ticks the Macros item while the palette is up, and greys Next / Previous
+    /// Tab when there's nowhere to go. Everything else targeted at this object
+    /// stays enabled, which is what AppKit was doing before this method existed.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(toggleMacroPalette) {
             menuItem.state = (macroPalette?.isVisible == true) ? .on : .off
+        }
+        // Nothing to move between with one tab, and nothing to move *in* when
+        // the front window isn't a world at all. Greyed out rather than quietly
+        // doing nothing, so the menu says so.
+        if menuItem.action == #selector(nextTab) || menuItem.action == #selector(previousTab) {
+            return frontWorldWindow()?.hasMultipleTabs == true
         }
         return true
     }
@@ -190,7 +237,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         macroPalette?.toggle()
     }
 
-    /// Watch every key press for one a macro in the frontmost world has claimed.
+    /// Watch every key press for one a macro in the frontmost world has claimed,
+    /// or for the two that move between that window's tabs.
     ///
     /// A local monitor rather than the responder chain, because a monitor sees
     /// the event *before* the main menu gets to claim its key equivalents. That
@@ -203,13 +251,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// menu item above. That's the right way round — the person who bound it
     /// said what they wanted more recently than this file did — but it does mean
     /// the palette is then reachable only from the menu.
-    private func installMacroKeyMonitor() {
-        guard macroKeyMonitor == nil else { return }
-        macroKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
             // nil swallows the event; returning it lets it carry on to the menu
             // and then the responder chain, exactly as if this weren't here.
-            return self.runMacro(for: event) ? nil : event
+            //
+            // Macros get first refusal and tab navigation only sees what they
+            // didn't want, on the same principle as ⌘K above: someone who binds
+            // a macro to ⌃⇥ has said so more recently than this file did.
+            if self.runMacro(for: event) { return nil }
+            if self.switchTab(for: event) { return nil }
+            return event
         }
     }
 
@@ -250,6 +304,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return session.runMacro(macro)
     }
 
+    // MARK: Tabs
+
+    /// The physical Tab key. A Carbon `kVK_` constant, fixed to a position on
+    /// the keyboard rather than to what that position types, and unchanged since
+    /// the Apple Extended Keyboard — the same reasoning `ShortcutFormat` uses
+    /// for Escape and Space.
+    private static let tabKeyCode: UInt16 = 48
+
+    /// Whether this key press was ⌃⇥ or ⌃⇧⇥ — and if so, having moved.
+    ///
+    /// Matched on the key *code* rather than on the character, because ⇧⇥ does
+    /// not report a tab character at all. It reports back-tab, a different
+    /// codepoint entirely, so a character comparison needs two spellings and
+    /// would still be at the mercy of the layout. One number, the same on every
+    /// keyboard, is why `KeyShortcut` stores codes too.
+    ///
+    /// This is also the half that does the work. The two Window menu items carry
+    /// the same key presses as captions — ⌃⇥ on the first, and back tab on the
+    /// second, which AppKit will most likely draw as ⌃⇧⇤ — and they will fire if
+    /// AppKit matches them, but a tab character as a menu key equivalent is not
+    /// something to rest on. Nothing can fire twice either way, because a match
+    /// here swallows the event before the menu is asked.
+    private func switchTab(for event: NSEvent) -> Bool {
+        guard event.keyCode == AppDelegate.tabKeyCode else { return false }
+
+        // Exactly ⌃, or exactly ⌃⇧. `shortcutModifiers` has already dropped caps
+        // lock and the function bit, which ride along on real presses without
+        // anyone having chosen them.
+        let modifiers = NSEvent.ModifierFlags(rawValue: event.shortcutModifiers)
+        guard modifiers.subtracting(.shift) == .control else { return false }
+
+        // Scoped exactly as macros are: only when a world window is the thing
+        // you're typing into, and not while a sheet or an alert is up. Without
+        // it, ⌃⇥ pressed in Settings would shuffle the tabs of a window behind.
+        guard let window = NSApp.keyWindow,
+              let worldWindow = window.delegate as? WorldWindow,
+              NSApp.modalWindow == nil, window.attachedSheet == nil else { return false }
+
+        // Swallowed from here on whether or not it moves — with a single tab
+        // there's nowhere to go, but the key is still spoken for, and letting it
+        // through would put a tab character in the command box instead.
+        //
+        // Repeats are dropped for the same reason macros drop them: holding the
+        // key would cycle at the keyboard's repeat rate, and every switch tears
+        // the session view down and builds it back.
+        guard !event.isARepeat else { return true }
+
+        if modifiers.contains(.shift) {
+            worldWindow.selectPreviousTab()
+        } else {
+            worldWindow.selectNextTab()
+        }
+        return true
+    }
+
     // MARK: Actions
 
     @objc private func connect() { WindowManager.shared.activeSession?.promptConnect() }
@@ -272,6 +381,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         window.closeWindow()
     }
+
+    /// Picked from the Window menu. No fallback when the front window isn't
+    /// ours, unlike ⌘W: there is nothing sensible to hand "next tab" back to,
+    /// and `validateMenuItem` has greyed the item out in that case anyway.
+    @objc private func nextTab() { frontWorldWindow()?.selectNextTab() }
+    @objc private func previousTab() { frontWorldWindow()?.selectPreviousTab() }
 
     /// The world window the user is actually looking at, or nil if something
     /// else is in front.
