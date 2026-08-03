@@ -1048,17 +1048,26 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         logLine(message)
     }
 
+    /// Show a line you typed in the scrollback — if this world is set to.
+    ///
+    /// Turned off for worlds that echo your commands back at you themselves, or
+    /// simply for anyone who would rather read the world's half of it. The guard
+    /// is here rather than at the call sites because this is the one funnel
+    /// every echoed line passes through, so there is nowhere to forget it.
+    ///
+    /// Nothing typed reaches the session log by either route. The log is the
+    /// world's transcript; a server that echoes puts your commands in it in the
+    /// world's own words, and one that doesn't was never going to.
     private func appendEcho(_ line: String) {
+        guard config.echoInput else { return }
         // A MUSH login carries the password on the same line as the character
         // name, and most servers never negotiate telnet ECHO to hide it. Mask
-        // it here, which is the one funnel every echoed line passes through, so
-        // it reaches neither the scrollback nor the log. What you typed is
+        // it here, on the way to the only place it goes. What you typed is
         // still in the history buffer, so ↑ brings the real line back.
         let shown = "› " + SessionFormat.redactLogin(line)
         let color = NSColor(srgbRed: 0.91, green: 0.82, blue: 0.38, alpha: 1)
         textView.textStorage?.append(renderer.systemLine(shown + "\n", color: color))
         textView.scrollToEndOfDocument(nil)
-        logLine(shown)
     }
 
     // MARK: Status bar

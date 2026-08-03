@@ -19,6 +19,7 @@ public struct WorldConfig: Codable, Equatable, Sendable {
     public var logEnabled: Bool            // write a session log while connected
     public var logDirectory: String        // "" means the per-world default folder
     public var chimeEnabled: Bool          // sound when this world talks in the background
+    public var echoInput: Bool             // show what you type in the scrollback
 
     public init(id: String = UUID().uuidString,
                 name: String = "My World",
@@ -30,7 +31,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
                 timers: [MudTimer] = [],
                 logEnabled: Bool = false,
                 logDirectory: String = "",
-                chimeEnabled: Bool = false) {
+                chimeEnabled: Bool = false,
+                echoInput: Bool = true) {
         self.id = id
         self.name = name
         self.host = host
@@ -42,11 +44,12 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.logEnabled = logEnabled
         self.logDirectory = logDirectory
         self.chimeEnabled = chimeEnabled
+        self.echoInput = echoInput
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, host, port, connectText, triggers, aliases, timers
-        case logEnabled, logDirectory, chimeEnabled
+        case logEnabled, logDirectory, chimeEnabled, echoInput
     }
 
     public init(from decoder: Decoder) throws {
@@ -64,6 +67,11 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         // Absent from every world file written before the chime existed, hence
         // `decodeIfPresent` like the rest — off is the right default anyway.
         self.chimeEnabled = try c.decodeIfPresent(Bool.self, forKey: .chimeEnabled) ?? false
+        // Defaults the other way round from the rest: a world file written
+        // before this existed comes from a client that echoed, so absent has to
+        // mean on or upgrading would silently stop showing people their own
+        // typing.
+        self.echoInput = try c.decodeIfPresent(Bool.self, forKey: .echoInput) ?? true
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -79,5 +87,6 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         try c.encode(logEnabled, forKey: .logEnabled)
         try c.encode(logDirectory, forKey: .logDirectory)
         try c.encode(chimeEnabled, forKey: .chimeEnabled)
+        try c.encode(echoInput, forKey: .echoInput)
     }
 }

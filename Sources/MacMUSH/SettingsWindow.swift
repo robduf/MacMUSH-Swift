@@ -41,6 +41,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     private let makeActiveButton = NSButton(title: "Make Active", target: nil, action: nil)
     private let activeLabel = NSTextField(labelWithString: "")
 
+    // Per-world display options. The bell is also the toggle in the status bar;
+    // this is the same setting reached the other way, for anyone who comes
+    // looking for it where the rest of a world's settings live.
+    private let echoCheck = NSButton(checkboxWithTitle: "Show what I type in the window",
+                                     target: nil, action: nil)
+    private let chimeCheck = NSButton(checkboxWithTitle: "Chime when this world talks in the background",
+                                      target: nil, action: nil)
+
     // Logging — per world, so you can keep a transcript of one MUSH and not another.
     private let logCheck = NSButton(checkboxWithTitle: "Save a log of every session",
                                     target: nil, action: nil)
@@ -180,6 +188,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         activeLabel.font = NSFont.systemFont(ofSize: 11)
         activeLabel.textColor = .secondaryLabelColor
 
+        echoCheck.target = self
+        echoCheck.action = #selector(echoCheckToggled)
+        echoCheck.toolTip = "Off is for worlds that repeat your commands back at you.\n"
+            + "Either way, what you type stays out of the session log."
+
+        chimeCheck.target = self
+        chimeCheck.action = #selector(chimeCheckToggled)
+        chimeCheck.toolTip = "The same setting as the bell in this world's status bar."
+
         logCheck.target = self
         logCheck.action = #selector(logCheckToggled)
 
@@ -299,6 +316,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
 
         for view in [nameLabel, hostLabel, portLabel, sendLabel,
                      nameField, hostField, portField, connectScroll,
+                     echoCheck, chimeCheck,
                      logCheck, logPathField, logChooseButton,
                      makeActiveButton, activeLabel] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -343,7 +361,15 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             connectScroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -14),
             connectScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
-            logCheck.topAnchor.constraint(equalTo: connectScroll.bottomAnchor, constant: 14),
+            echoCheck.topAnchor.constraint(equalTo: connectScroll.bottomAnchor, constant: 14),
+            echoCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            echoCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
+
+            chimeCheck.topAnchor.constraint(equalTo: echoCheck.bottomAnchor, constant: 8),
+            chimeCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            chimeCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
+
+            logCheck.topAnchor.constraint(equalTo: chimeCheck.bottomAnchor, constant: 8),
             logCheck.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             logCheck.trailingAnchor.constraint(lessThanOrEqualTo: pane.trailingAnchor, constant: -14),
 
@@ -460,6 +486,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         hostField.stringValue = world.host
         portField.stringValue = "\(world.port)"
         connectTextView.string = world.connectText
+        echoCheck.state = world.echoInput ? .on : .off
+        chimeCheck.state = world.chimeEnabled ? .on : .off
         logCheck.state = world.logEnabled ? .on : .off
         logPathField.stringValue = world.logDirectory
         updateLogControls()
@@ -774,6 +802,29 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         let text = connectTextView.string
         guard worlds[i].connectText != text else { return }
         worlds[i].connectText = text
+        commitWorld(at: i)
+    }
+
+    // MARK: Display options
+
+    @objc private func echoCheckToggled() {
+        // A checkbox doesn't take first responder, so anything being typed in a
+        // field right now is still open in its editor. Commit it before we write,
+        // the same as the logging checkbox does.
+        endEditing()
+        guard let i = editingIndex else { return }
+        let on = echoCheck.state == .on
+        guard worlds[i].echoInput != on else { return }
+        worlds[i].echoInput = on
+        commitWorld(at: i)
+    }
+
+    @objc private func chimeCheckToggled() {
+        endEditing()
+        guard let i = editingIndex else { return }
+        let on = chimeCheck.state == .on
+        guard worlds[i].chimeEnabled != on else { return }
+        worlds[i].chimeEnabled = on
         commitWorld(at: i)
     }
 
