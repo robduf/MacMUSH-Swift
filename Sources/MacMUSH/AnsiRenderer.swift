@@ -7,8 +7,12 @@ import MudEngine
 final class AnsiRenderer {
     private let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
     private let boldFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
-    let defaultForeground = NSColor(srgbRed: 0.84, green: 0.84, blue: 0.88, alpha: 1)
-    let background = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.08, alpha: 1)
+    // Kept as properties rather than used from `Theme` directly at each call
+    // site: `inverse` below has to swap a run's colours with whatever the
+    // *scrollback* is showing, so the renderer genuinely needs to know its own
+    // background, not just where to look one up.
+    let defaultForeground = Theme.foreground
+    let background = Theme.scrollback
 
     private let maxLength = 600_000
     private let trimTo = 500_000

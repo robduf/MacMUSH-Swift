@@ -8,9 +8,24 @@ This is a ground-up Swift rewrite of MacMUSH: a small AppKit app with a
 Foundation-only engine underneath. No bundled browser, no JavaScript — just a
 real Mac app that launches instantly and sips memory.
 
-> Status: early MVP. It connects, negotiates telnet, renders ANSI colour, and
-> sends commands with history. Triggers, aliases, timers, Lua scripting, logging,
-> MCCP2 and GMCP are the next layers (the engine is structured for them).
+> Status: usable daily. Multiple worlds open at once, each in its own tab, each
+> with its own live connection and log; telnet negotiation, ANSI colour, command
+> history, triggers, aliases and timers all work. Lua scripting, MCCP2 and GMCP
+> are the next layers (the engine is structured for them).
+
+## Windows and tabs
+
+**⌘N** opens a new window, **⌘T** adds a tab to the one you're using, **⌘W**
+closes the current tab (or the window, if it's down to its last one). Drag a
+window to a second monitor and watch two worlds side by side.
+
+A world can only be open in one tab at a time — two tabs on one world would mean
+two sockets logging in as the same character and two logs appending to the same
+file — so opening a world that's already open just brings its tab forward.
+
+Each tab shows a green dot while it's connected. Tabs you aren't looking at
+keep running: they stay connected, keep logging, and keep firing their triggers
+and timers.
 
 ## What you need
 
@@ -84,9 +99,13 @@ Sources/
   MacMUSH/            the AppKit app (code-only, no storyboards)
     main.swift            NSApplication entry
     AppDelegate.swift     menus
-    WorldWindow.swift     window, text view, input, history, status bar
+    WindowManager.swift   every open window; one world, one tab, app-wide
+    WorldWindow.swift     one window: its tab bar and the sessions in it
+    TabBarView.swift      the row of tabs, with connected dot and unread badge
+    Session.swift         one tab: socket, text view, input, history, log
     SettingsWindow.swift  world editor (connection, triggers, aliases, logging)
     MudConnection.swift   TCP via Network.framework
+    Theme.swift           the window's colours, in one place
     AnsiRenderer.swift    MudColor → NSColor, attributed text
     SessionLogger.swift   per-world plain-text session logs
     WorldStore.swift      loads/saves the world list

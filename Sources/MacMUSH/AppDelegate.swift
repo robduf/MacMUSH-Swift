@@ -3,7 +3,6 @@ import AppKit
 import MudEngine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var worldWindow: WorldWindow?
     private var settingsWindow: SettingsWindow?
     private var worldsMenu: NSMenu?
 
@@ -11,9 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
 
-        let world = WorldWindow()
-        world.showWindow()
-        worldWindow = world
+        WindowManager.shared.openInitialWindow()
 
         // Keep the Worlds menu in sync whenever the store changes (add / rename /
         // delete / switch, or a slash-command edit).
@@ -29,11 +26,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    /// Quitting mid-session still closes the log properly — footer written, file
-    /// handle released — and shuts the socket instead of leaving the MUD to time
-    /// the connection out on its own.
+    /// ⌘Q with a world still on the other end of a socket. Closing a window
+    /// asks separately and disconnects as it goes, so by the time the last one
+    /// closes there's nothing live left and this doesn't fire a second prompt.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard WindowManager.shared.hasConnectedSession else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "Quit while still connected?"
+        alert.informativeText = "You're connected to at least one world. Quitting disconnects and closes any session logs."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    /// Quitting mid-session still closes the logs properly — footers written,
+    /// file handles released — and shuts the sockets instead of leaving the MUDs
+    /// to time the connections out on their own.
     func applicationWillTerminate(_ notification: Notification) {
-        worldWindow?.disconnect()
+        WindowManager.shared.disconnectAll()
     }
 
     // MARK: Menu
@@ -57,16 +67,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit MacMUSH", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
-        // File menu
+        // File menu — Safari's arrangement, because that's the one everybody
+        // already has in their fingers: ⌘N window, ⌘T tab, ⌘W tab, ⇧⌘W window.
         let fileItem = NSMenuItem()
         mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File")
         fileItem.submenu = fileMenu
+        let newWindowItem = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindow), keyEquivalent: "n")
+        newWindowItem.target = self
+        let newTabItem = fileMenu.addItem(withTitle: "New Tab…", action: #selector(newTab), keyEquivalent: "t")
+        newTabItem.target = self
+        fileMenu.addItem(.separator())
         let connectItem = fileMenu.addItem(withTitle: "Connect…", action: #selector(connect), keyEquivalent: "r")
         connectItem.target = self
         let disconnectItem = fileMenu.addItem(withTitle: "Disconnect", action: #selector(disconnect), keyEquivalent: "d")
         disconnectItem.keyEquivalentModifierMask = [.command, .shift]
         disconnectItem.target = self
+        fileMenu.addItem(.separator())
+        let closeTabItem = fileMenu.addItem(withTitle: "Close Tab", action: #selector(closeTab), keyEquivalent: "w")
+        closeTabItem.target = self
+        let closeWindowItem = fileMenu.addItem(withTitle: "Close Window", action: #selector(closeWindow), keyEquivalent: "w")
+        closeWindowItem.keyEquivalentModifierMask = [.command, .shift]
+        closeWindowItem.target = self
 
         // Worlds menu (populated by rebuildWorldsMenu)
         let worldsItem = NSMenuItem()
@@ -88,20 +110,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
-        // Window menu
+        // Window menu. AppKit fills the bottom of this in with one item per open
+        // window once `NSApp.windowsMenu` is set, which is exactly what you want
+        // the moment there's more than one.
         let windowItem = NSMenuItem()
         mainMenu.addItem(windowItem)
         let windowMenu = NSMenu(title: "Window")
         windowItem.submenu = windowMenu
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
         NSApp.windowsMenu = windowMenu
 
         NSApp.mainMenu = mainMenu
     }
 
     /// Rebuild the Worlds menu from the store: one checkable item per world
-    /// (⌘1…⌘9 for the first nine), then add / rename / delete actions.
+    /// (⌘1…⌘9 for the first nine), then add / rename / delete actions. The tick
+    /// marks the world in the frontmost tab.
     private func rebuildWorldsMenu() {
         guard let menu = worldsMenu else { return }
         menu.removeAllItems()
@@ -131,54 +157,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func worldStoreChanged() {
         rebuildWorldsMenu()
-        syncLiveWindow()
-    }
-
-    /// Push store changes into the live window: edits made in the Worlds window
-    /// apply in place, and if the world it was showing has been deleted it moves
-    /// to whatever the store selected in its stead.
-    private func syncLiveWindow() {
-        guard let window = worldWindow else { return }
-        let store = WorldStore.shared
-        if let current = store.worlds.first(where: { $0.id == window.currentWorldID }) {
-            window.syncActiveWorld(current)
-        } else {
-            window.activate(world: store.selectedWorld)
-        }
+        WindowManager.shared.syncAll()
     }
 
     // MARK: Actions
 
-    @objc private func connect() { worldWindow?.promptConnect() }
-    @objc private func disconnect() { worldWindow?.disconnect() }
+    @objc private func connect() { WindowManager.shared.activeSession?.promptConnect() }
+    @objc private func disconnect() { WindowManager.shared.activeSession?.disconnect() }
+
+    @objc private func newWindow() { WindowManager.shared.newWindow() }
+    @objc private func newTab() { WindowManager.shared.newTab() }
+    @objc private func closeTab() {
+        guard let window = frontWorldWindow() else {
+            NSApp.keyWindow?.performClose(nil)
+            return
+        }
+        window.closeActiveTab()
+    }
+
+    @objc private func closeWindow() {
+        guard let window = frontWorldWindow() else {
+            NSApp.keyWindow?.performClose(nil)
+            return
+        }
+        window.closeWindow()
+    }
+
+    /// The world window the user is actually looking at, or nil if something
+    /// else is in front.
+    ///
+    /// ⌘W and ⇧⌘W are wired to this object rather than to a window, which means
+    /// they fire no matter what's frontmost. Without this check, pressing ⌘W
+    /// with Settings in front would reach straight past it and close a tab in
+    /// some world window behind — one the user isn't even looking at. When the
+    /// front window isn't ours, the callers hand ⌘W back to it, which is what
+    /// AppKit would have done with it anyway.
+    ///
+    /// No key window means no answer — deliberately. Falling back to the *last*
+    /// world window looks helpful and isn't: miniaturise everything and there is
+    /// no key window, so ⌘W would close a window you can't see, and a window
+    /// down to its last tab closes for real, which takes the app with it.
+    private func frontWorldWindow() -> WorldWindow? {
+        NSApp.keyWindow?.delegate as? WorldWindow
+    }
 
     @objc private func showSettings() {
         if settingsWindow == nil {
             let settings = SettingsWindow()
-            settings.onActivateWorld = { [weak self] world in
-                WorldStore.shared.select(id: world.id)
-                self?.worldWindow?.activate(world: world)
+            settings.onActivateWorld = { world in
+                WindowManager.shared.openWorld(world)
             }
             settingsWindow = settings
         }
         settingsWindow?.show()
     }
 
+    /// ⌘1…⌘9. Focuses the world's tab if it's already open anywhere, otherwise
+    /// opens it in a new tab — a world is never in two tabs at once.
     @objc private func switchWorld(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        guard id != WorldStore.shared.selectedWorldID else { return }
-        WorldStore.shared.select(id: id)
-        worldWindow?.activate(world: WorldStore.shared.selectedWorld)
+        guard let id = sender.representedObject as? String,
+              let world = WorldStore.shared.worlds.first(where: { $0.id == id }) else { return }
+        WindowManager.shared.openWorld(world)
     }
 
     @objc private func newWorld() {
         guard let name = promptText(title: "New World",
-                                    info: "Name this world. You can set its host and port with ⌘R after it opens.",
+                                    info: "Name this world. You can set its host and port with ⌘R after its tab opens.",
                                     defaultValue: "New World"),
               !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        // `insertWorld` leaves the selection alone; opening the tab is what makes
+        // the new world current, and having both do it would fight.
         let world = WorldConfig(name: name)
-        WorldStore.shared.addWorld(world)
-        worldWindow?.activate(world: WorldStore.shared.selectedWorld)
+        WorldStore.shared.insertWorld(world)
+        WindowManager.shared.openWorld(world)
     }
 
     @objc private func renameWorld() {
@@ -188,7 +239,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     defaultValue: current.name),
               !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         WorldStore.shared.renameSelected(to: name)
-        worldWindow?.syncActiveWorld(WorldStore.shared.selectedWorld)
     }
 
     @objc private func deleteWorld() {
@@ -208,8 +258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // The store notifies, and every window closes the orphaned tab itself.
         store.removeWorld(id: current.id)
-        worldWindow?.activate(world: store.selectedWorld)
     }
 
     // MARK: Helpers

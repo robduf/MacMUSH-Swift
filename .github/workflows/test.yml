@@ -23,4 +23,4 @@ jobs:
 
       # Runs the MudEngine unit suite (telnet + ANSI parsing).
       - name: Test
-        run: swift test
+        run: swift run MudEngineTests

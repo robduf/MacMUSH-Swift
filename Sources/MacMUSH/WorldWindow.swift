@@ -2,971 +2,567 @@
 import AppKit
 import MudEngine
 
-/// One MUD window: scrollback text view, command input, status line, and the
-/// connection wiring. Code-only AppKit — no storyboards.
+/// One window, holding one or more `Session`s behind a tab bar.
 ///
-/// Output and input are the two halves of an `NSSplitView`, so the command box
-/// can be dragged to whatever height suits the pose you're writing, and it word
-/// wraps instead of scrolling sideways off the end of the world.
-final class WorldWindow: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
+/// This used to be the whole app: window, text views, connection, triggers, the
+/// lot. All of that except the window itself now lives in `Session`, and what's
+/// left here is the container — a tab bar across the top, and below it whichever
+/// session's view is frontmost. Switching tabs swaps that one view. Nothing
+/// about a background session is paused, stopped or torn down: its socket is
+/// still open, its timers still fire, its log still fills, and its scrollback
+/// still grows. It simply isn't on screen.
+///
+/// Windows are peers. `WindowManager` owns them all and knows which is key;
+/// nothing here reaches for another window.
+final class WorldWindow: NSObject, NSWindowDelegate {
     private let window: NSWindow
-    private let splitView = NSSplitView()
-    private let scrollView = NSScrollView()
-    private let textView: NSTextView
+    private let tabBar = TabBarView()
+    /// Whichever session is frontmost is the only subview this ever has.
+    private let container = NSView()
 
-    private let inputPane = NSView()
-    private let inputScroll = NSScrollView()
-    private let inputView: NSTextView
-    private let promptLabel = NSTextField(labelWithString: "›")
+    private(set) var sessions: [Session] = []
+    private(set) var activeIndex = 0
+    /// Set while a coalesced bar redraw is waiting on the run loop.
+    private var tabRefreshScheduled = false
+    /// Set while the "+" world picker is on screen.
+    private var pickerPending = false
 
-    private let statusLabel = NSTextField(labelWithString: "Not connected")
-    private let logBadge = NSTextField(labelWithString: "LOG")
-    private let elapsedLabel = NSTextField(labelWithString: "")
-
-    private let renderer = AnsiRenderer()
-    private var ansi = AnsiParser()
-    private var connection: MudConnection?
-    private let logger = SessionLogger()
-
-    private var config = WorldStore.shared.selectedWorld
-    private var isConnected = false
-    private var currentHost = ""
-    private var currentPort: UInt16 = 0
-    private var connectedAt: Date?
-
-    private var history: [String] = []
-    private var historyIndex = -1
-    private var draft = ""
-    private var echoOn = true
-    private var warnedNotConnected = false
-
-    // Incoming lines are assembled here so triggers can match a whole line.
-    private var pendingOps: [AnsiOp] = []
-    private var pendingPlain = ""
-
-    // Timer scheduling: next fire date per timer id.
-    private var timerFireDates: [String: Date] = [:]
-    private var tickTimer: Timer?
+    var activeSession: Session? {
+        sessions.indices.contains(activeIndex) ? sessions[activeIndex] : nil
+    }
 
     override init() {
+        // `.fullSizeContentView` is what makes the tab bar the title bar. It
+        // runs the content view up under the titlebar strip instead of starting
+        // it below, so the bar — pinned to the top of that content view a few
+        // lines down — lands in the strip itself, with the traffic lights
+        // floating over its leading end. Together with the transparent titlebar
+        // and hidden title set after `super.init()`, that's one row across the
+        // top of the window rather than a title bar with a tab bar under it.
+        //
+        // 628 rather than 600 because the content rect now *includes* the
+        // titlebar strip: at 600 the window would come up 28pt shorter on screen
+        // than it used to for the same amount of scrollback.
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 628),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        // `layout()` hands both text views their real geometry a few lines down.
-        // These frames only have to be non-degenerate so the layout manager has
-        // somewhere to put glyphs before the first pass — which is more than the
-        // old code managed, since it sized the output view from the contentSize
-        // of a scroll view that was still sitting at the origin with zero area.
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 884, height: 452))
-        inputView = NSTextView(frame: NSRect(x: 0, y: 0, width: 860, height: 64))
 
-        // Every stored property this class introduces now holds a value, so
-        // control can pass up to NSObject.
-        //
-        // Nothing above this line may *read* a property. Swift's two-phase
-        // initialisation lets a subclass assign to its own stored properties
-        // before `super.init()` but not read them back, and `window.title = …`
-        // is a read of `window` followed by a write to the object it points at —
-        // which is why every configuration statement now lives below the call
-        // rather than above it.
+        // Nothing above this line may *read* a property: `window.title = …` is a
+        // read of `window` followed by a write to the object it points at, and
+        // Swift's two-phase initialisation only lets a subclass *assign* to its
+        // own stored properties before `super.init()`.
         super.init()
 
         window.title = "MacMUSH"
         window.minSize = NSSize(width: 520, height: 320)
+        // The manager decides when a window goes away. Without this, closing one
+        // would drop the last reference out from under the array holding it.
         window.isReleasedWhenClosed = false
+        window.delegate = self
 
-        // --- output text view inside a scroll view ---
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = false
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = true
+        // The other half of `.fullSizeContentView`: with the titlebar drawn
+        // transparent and its text hidden, there's nothing up there but the
+        // traffic lights, and the tab bar underneath shows through as the top
+        // row of the window. The title itself is still set — it's what the
+        // Window menu lists this window as.
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        // `.automatic` draws a line under the titlebar for some window
+        // configurations, and it would land across the middle of the tab strip.
+        window.titlebarSeparatorStyle = .none
+        // Pinned dark rather than following the system. The scrollback is a
+        // terminal with hardcoded ANSI colours on a near-black background, so a
+        // world window is dark whatever macOS is doing — and the semantic
+        // colours the tab bar and status line use (`labelColor`,
+        // `separatorColor`) have to resolve against that, not against a light
+        // window that isn't there. The Worlds window is left following the
+        // system: it's an ordinary Mac editor, not a terminal.
+        window.appearance = NSAppearance(named: .darkAqua)
+        // Fills the margins around the split view and the strip the status line
+        // sits on, so the top chrome, the bottom chrome and the gaps between
+        // them are one colour instead of three.
+        window.backgroundColor = Theme.chrome
 
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = true
-        textView.backgroundColor = renderer.background
-        textView.textContainerInset = NSSize(width: 8, height: 6)
-        textView.textContainer?.size = NSSize(width: textView.frame.width,
-                                              height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = true
-        scrollView.documentView = textView
-
-        // --- input: a real text view, so it wraps and can be resized ---
-        inputScroll.hasVerticalScroller = true
-        inputScroll.autohidesScrollers = true
-        inputScroll.borderType = .noBorder
-        inputScroll.drawsBackground = true
-        inputScroll.backgroundColor = renderer.background
-
-        inputView.minSize = NSSize(width: 0, height: 0)
-        inputView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
-                                   height: CGFloat.greatestFiniteMagnitude)
-        inputView.isVerticallyResizable = true
-        inputView.isHorizontallyResizable = false
-        inputView.autoresizingMask = [.width]
-        inputView.isRichText = false
-        inputView.allowsUndo = true
-        inputView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        inputView.drawsBackground = true
-        inputView.backgroundColor = renderer.background
-        inputView.textColor = renderer.defaultForeground
-        inputView.insertionPointColor = renderer.defaultForeground
-        inputView.textContainerInset = NSSize(width: 2, height: 4)
-        inputView.textContainer?.size = NSSize(width: inputView.frame.width,
-                                               height: CGFloat.greatestFiniteMagnitude)
-        inputView.textContainer?.widthTracksTextView = true
-        // macOS "helpfully" turns "don't" into "don’t" and -- into an em dash.
-        // A MUSH takes those literally, so `page bob="don't"` would go out with
-        // a curly quote the server has never heard of.
-        inputView.isAutomaticQuoteSubstitutionEnabled = false
-        inputView.isAutomaticDashSubstitutionEnabled = false
-        inputView.isAutomaticTextReplacementEnabled = false
-        inputView.isAutomaticSpellingCorrectionEnabled = false
-        inputScroll.documentView = inputView
-
-        promptLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
-        promptLabel.textColor = .tertiaryLabelColor
-
-        // --- status bar ---
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-
-        logBadge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
-        logBadge.textColor = .systemGreen
-        logBadge.isHidden = true
-
-        // Monospaced digits, or the timer jitters a pixel every second as the
-        // glyph widths change under it.
-        elapsedLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        elapsedLabel.textColor = .secondaryLabelColor
-
-        inputView.delegate = self
-        splitView.delegate = self
-
-        layout()
-
-        // An NSTextView sizes itself to its text, so with a minimum height of
-        // zero the blank space under a one-line command isn't part of the view
-        // at all and clicking there does nothing. Keep the minimum matched to
-        // whatever is visible, which changes every time the divider moves.
-        inputScroll.contentView.postsFrameChangedNotifications = true
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(inputClipResized(_:)),
-            name: NSView.frameDidChangeNotification, object: inputScroll.contentView)
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-        // The run loop holds the ticker, not this object. Weak capture keeps it
-        // from crashing, but without this it goes on waking once a second
-        // forever after the window is gone.
-        stopTicker()
-    }
-
-    private func layout() {
         let content = NSView()
-
-        buildInputPane()
-
-        // NSSplitView positions its subviews itself, so those keep their
-        // autoresizing masks — only the split view is constraint-driven. The
-        // starting frames below decide the first-run proportions; after that,
-        // `autosaveName` restores wherever the user left the divider.
-        splitView.isVertical = false
-        splitView.dividerStyle = .thin
-        scrollView.frame = NSRect(x: 0, y: 0, width: 884, height: 452)
-        inputPane.frame = NSRect(x: 0, y: 0, width: 884, height: 76)
-        splitView.addSubview(scrollView)
-        splitView.addSubview(inputPane)
-        // Set last: a saved divider position needs subviews to restore onto.
-        splitView.autosaveName = "MacMUSH.outputInputSplit"
-
-        for view in [splitView, statusLabel, logBadge, elapsedLabel] as [NSView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
+        for sub in [tabBar, container] as [NSView] {
+            sub.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(sub)
         }
-
-        // A long host name shouldn't shove the timer off the right edge — let
-        // the status text truncate and keep the readouts pinned.
-        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        for label in [logBadge, elapsedLabel] {
-            label.setContentCompressionResistancePriority(.required, for: .horizontal)
-            label.setContentHuggingPriority(.required, for: .horizontal)
-        }
-        // The clock is empty until you connect. Its width is reserved below so
-        // the LOG badge doesn't slide sideways the moment it starts ticking —
-        // which means hugging has to yield to that reservation rather than
-        // fight it and log a broken-constraint warning.
-        elapsedLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(999), for: .horizontal)
-
         NSLayoutConstraint.activate([
-            splitView.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
-            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
+            tabBar.topAnchor.constraint(equalTo: content.topAnchor),
+            tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            tabBar.heightAnchor.constraint(equalToConstant: TabBarView.barHeight),
 
-            statusLabel.topAnchor.constraint(equalTo: splitView.bottomAnchor, constant: 6),
-            statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
-
-            logBadge.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            logBadge.leadingAnchor.constraint(greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 8),
-
-            elapsedLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            elapsedLabel.leadingAnchor.constraint(equalTo: logBadge.trailingAnchor, constant: 8),
-            elapsedLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            elapsedLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
+            container.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
         window.contentView = content
         window.center()
+        // Not before `contentView` is set: the traffic lights live in the theme
+        // frame, and asking for one measures it into existence only once the
+        // window has a content view to lay out around.
+        tabBar.leadingInset = trafficLightInset
+
+        // By world id, not by position: the bar defers clicks by a turn of the
+        // run loop, and a tab closing in between would otherwise make a pending
+        // click land on whichever world had slid into that slot.
+        tabBar.onSelect = { [weak self] id in self?.selectTab(worldID: id) }
+        tabBar.onClose = { [weak self] id in self?.closeTab(worldID: id) }
+        tabBar.onNew = { [weak self] in self?.promptNewTab() }
     }
 
-    /// The bottom half of the split: a "›" prompt beside the wrapping command
-    /// box. The pane itself is frame-driven (the split view owns it); the two
-    /// things inside it use constraints as usual.
-    private func buildInputPane() {
-        for view in [promptLabel, inputScroll] as [NSView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            inputPane.addSubview(view)
-        }
-        NSLayoutConstraint.activate([
-            promptLabel.topAnchor.constraint(equalTo: inputPane.topAnchor, constant: 6),
-            promptLabel.leadingAnchor.constraint(equalTo: inputPane.leadingAnchor, constant: 6),
+    // MARK: Window
 
-            inputScroll.topAnchor.constraint(equalTo: inputPane.topAnchor, constant: 2),
-            inputScroll.leadingAnchor.constraint(equalTo: promptLabel.trailingAnchor, constant: 4),
-            inputScroll.trailingAnchor.constraint(equalTo: inputPane.trailingAnchor, constant: -2),
-            inputScroll.bottomAnchor.constraint(equalTo: inputPane.bottomAnchor, constant: -2),
-        ])
-    }
-
-    // MARK: Split view
-
-    /// Window resizing grows and shrinks the scrollback; the command box keeps
-    /// whatever height it was dragged to.
-    func splitView(_ splitView: NSSplitView, shouldAdjustSizeOfSubview view: NSView) -> Bool {
-        view === scrollView
-    }
-
-    func splitView(_ splitView: NSSplitView,
-                   constrainMinCoordinate proposedMinimumPosition: CGFloat,
-                   ofSubviewAt dividerIndex: Int) -> CGFloat {
-        max(proposedMinimumPosition, 120)
-    }
-
-    func splitView(_ splitView: NSSplitView,
-                   constrainMaxCoordinate proposedMaximumPosition: CGFloat,
-                   ofSubviewAt dividerIndex: Int) -> CGFloat {
-        // Always leave room for at least one line of input plus its insets,
-        // otherwise the box can be collapsed to nothing and there's no obvious
-        // way to get it back.
-        let floor = splitView.bounds.height - splitView.dividerThickness - 34
-        return min(proposedMaximumPosition, max(120, floor))
-    }
-
-    @objc private func inputClipResized(_ note: Notification) {
-        syncInputMinHeight()
-    }
-
-    /// Make the whole command box a click target rather than only the lines
-    /// that happen to have text on them.
-    private func syncInputMinHeight() {
-        let visible = inputScroll.contentView.bounds.height
-        guard visible > 1, inputView.minSize.height != visible else { return }
-        inputView.minSize = NSSize(width: 0, height: visible)
-        inputView.sizeToFit()
-    }
-
-    func showWindow() {
-        window.title = "MacMUSH — \(config.name)"
+    func show() {
         window.makeKeyAndOrderFront(nil)
-        syncInputMinHeight()
-        _ = window.makeFirstResponder(inputView)
-        updateStatus()
-        showWelcome()
+        // Measured again now that the window has actually been put on screen: at
+        // `init` time the theme frame may not have laid the buttons out yet and
+        // the inset would have come from the fallback. Free when it agrees —
+        // `leadingInset` doesn't touch the constraint unless the number moved.
+        tabBar.leadingInset = trafficLightInset
+        activeSession?.focusInput()
     }
 
-    private func showWelcome() {
-        appendSystem("MacMUSH — a native Swift MUD client.")
-        appendSystem("World: \(config.name)  —  ⌘R to connect (\(config.host) \(config.port)). Switch or add worlds in the Worlds menu.")
-        appendSystem("Type /help for triggers, aliases and timers. They're saved per world, between sessions.")
-        appendSystem("Test target:  node scripts/fake-mud.js  →  connect to 127.0.0.1 4000.\n")
+    /// Nudge a window that's already open — used when a world you asked for
+    /// turns out to be open in some other window already.
+    func bringToFront() {
+        window.makeKeyAndOrderFront(nil)
     }
 
-    // MARK: Connection
+    var isKeyWindow: Bool { window.isKeyWindow }
 
-    func connect(host: String, port: UInt16) {
-        disconnect()
-        currentHost = host
-        currentPort = port
-        config.host = host
-        config.port = port
-        saveConfig()
-        ansi.resetStyle()
-        pendingOps = []
-        pendingPlain = ""
-        warnedNotConnected = false
-        appendSystem("Connecting to \(host):\(port)…")
-
-        let conn = MudConnection(host: host, port: port)
-        conn.onText = { [weak self] text in self?.render(text) }
-        conn.onPrompt = { [weak self] in self?.flushLine(isPrompt: true) }
-        conn.onEcho = { [weak self] on in self?.setEcho(on) }
-        conn.onNotice = { [weak self] message in self?.appendSystem(message) }
-        conn.onStateChange = { [weak self] connected, message in
-            guard let self = self else { return }
-            self.isConnected = connected
-            if connected {
-                self.connectedAt = Date()
-                // Open the log before the first line is printed, so "Connected."
-                // and everything the MUD greets you with lands in the file.
-                self.startLoggingIfEnabled()
-                self.updateStatus()
-                self.appendSystem("Connected.")
-                self.sendConnectText()
-                self.armTimers()
-                self.startTicker()
-            } else {
-                if let message = message { self.appendSystem(message) }
-                self.connectedAt = nil
-                self.setEcho(true)
-                self.stopTicker()
-                self.stopLogging()
-                self.updateStatus()
-            }
-        }
-        conn.start()
-        connection = conn
+    /// Offset each new window from the last so they don't land in a single pile.
+    func cascade(from previous: WorldWindow?) {
+        guard let previous = previous else { return }
+        let origin = previous.window.frame.origin
+        window.setFrameTopLeftPoint(
+            NSPoint(x: origin.x + 24,
+                    y: origin.y + previous.window.frame.height - 24))
     }
 
-    func disconnect() {
-        connection?.disconnect()
-        connection = nil
-        isConnected = false
-        connectedAt = nil
-        // Dropping the connection deallocates the object whose callback would
-        // otherwise have turned echo back on, so do it here. Otherwise a
-        // disconnect during a password prompt leaves every line of the *next*
-        // session missing from the scrollback and the log.
-        setEcho(true)
-        stopTicker()
-        stopLogging()
-        // The next thing typed deserves its own "Not connected." — the warning
-        // is once per batch, not once per lifetime of the window.
-        warnedNotConnected = false
-        updateStatus()
-    }
-
-    /// The world this window is currently bound to.
-    var currentWorldID: String { config.id }
-
-    /// Switch the live window to a different saved world. Drops any current
-    /// connection; the new world connects on the next ⌘R / /connect.
-    func activate(world: WorldConfig) {
-        if isConnected || connection != nil {
-            disconnect()
-        }
-        config = world
-        ansi.resetStyle()
-        pendingOps = []
-        pendingPlain = ""
-        timerFireDates.removeAll()
-        setEcho(true)
-        window.title = "MacMUSH — \(world.name)"
-        updateStatus()
-        appendSystem("— Switched to \(world.name)  (\(world.host) \(world.port)).  ⌘R to connect. —")
-    }
-
-    /// Adopt edits to the world this window is already showing — a rename, or a
-    /// change made in the Worlds window — without disturbing the connection or
-    /// scrollback. New triggers and aliases take effect on the next line; timers
-    /// are re-armed below.
-    func syncActiveWorld(_ world: WorldConfig) {
-        guard world.id == config.id else { return }
-        let oldDirectory = config.logDirectory
-        let wasEnabled = config.logEnabled
-        config = world
-        window.title = "MacMUSH — \(world.name)"
-        reconcileTimers()
-
-        // Ticking the logging box takes effect on the session you're sitting in
-        // rather than the next one. Keyed off the box *changing*, not off the
-        // logger being inactive: this method also runs on every /alias, every
-        // /timer and every one-shot timer expiry, so a retry-while-inactive
-        // would re-attempt a failing folder — and print its error — over and
-        // over for the rest of the evening. Untick and re-tick to retry.
+    /// How far in from the leading edge the tabs have to start to clear the
+    /// traffic lights.
+    ///
+    /// Measured rather than guessed: the buttons' size and spacing have changed
+    /// across macOS releases, and a number baked in here would put the first tab
+    /// under the zoom button the next time they change. The fallback is what
+    /// they measure today, so if the theme frame hasn't laid itself out yet the
+    /// bar still starts in the right place rather than in the corner.
+    private var trafficLightInset: CGFloat {
+        // Full screen takes the traffic lights away along with the rest of the
+        // title bar, so there's nothing left to clear and the gap they needed
+        // would just be a hole in the corner. Checked here rather than at the
+        // call sites so every caller gets it right, including the delegate
+        // callbacks below — the mask is already updated by the time those run.
+        guard !window.styleMask.contains(.fullScreen) else { return 6 }
+        guard let zoom = window.standardWindowButton(.zoomButton) else { return 72 }
+        // `to: nil` converts to *window* coordinates, which is what the bar's
+        // leading edge is measured in too — the buttons aren't in the content
+        // view's hierarchy at all, so there's no shared superview to go via.
         //
-        // Changing the *folder* deliberately doesn't apply until you reconnect.
-        // Honouring it live would roll the log file, and create a directory, for
-        // every half-finished path on the way to the real one.
-        if isConnected {
-            if !config.logEnabled {
-                stopLogging()
-            } else if !wasEnabled {
-                startLoggingIfEnabled()
-            } else if oldDirectory != config.logDirectory {
-                // Two different truths: if a log is running, the new folder is
-                // simply queued for next time. If one *isn't* — the last start
-                // failed — then saying "next time you connect" reads as though
-                // something is being kept, when nothing is.
-                appendSystem(logger.isActive
-                    ? "Log folder changed — it takes effect next time you connect."
-                    : "Log folder changed — untick and re-tick logging to start writing there now.")
+        // Floored rather than trusted outright. A button the theme frame hasn't
+        // positioned yet still measures its *intrinsic* size sitting at the
+        // origin, so it reports a maxX in the teens — a plausible-looking number
+        // rather than an obviously wrong zero, which would put the first tab
+        // squarely under the minimise button. The floor is what they measure
+        // today, so a bad reading costs a few points of gap and a good one is
+        // always larger than it anyway.
+        return max(72, zoom.convert(zoom.bounds, to: nil).maxX + 12)
+    }
+
+    // MARK: Tabs
+
+    /// Open a world in a new tab and switch to it. The caller has already made
+    /// sure this world isn't open somewhere else.
+    @discardableResult
+    func addTab(world: WorldConfig) -> Session {
+        let session = Session(world: world)
+        session.onChange = { [weak self] in self?.refreshTabs() }
+        sessions.append(session)
+        session.start()
+        selectTab(at: sessions.count - 1)
+        return session
+    }
+
+    /// `claimingCurrentWorld` says whether this tab's world should become *the*
+    /// current world app-wide. True for anything the user did on purpose — a
+    /// click, ⌘T, opening a world from the Worlds menu. False when a window is
+    /// merely tidying up after a deletion somewhere else, because there is only
+    /// one current world and a background window has no business naming it.
+    func selectTab(at index: Int, claimingCurrentWorld: Bool = true) {
+        guard sessions.indices.contains(index) else { return }
+        activeIndex = index
+        showActiveSession()
+        // Straight to the redraw rather than through the coalescing path: you
+        // just clicked, and the highlight should move under your finger.
+        redrawTabs()
+        // Keep the store's idea of the current world matched to the frontmost
+        // tab, so Rename / Delete / the Worlds window all act on what you're
+        // actually looking at.
+        if claimingCurrentWorld, let session = activeSession {
+            WorldStore.shared.select(id: session.worldID)
+        }
+    }
+
+    /// The index of the tab showing a given world, if this window has one.
+    func indexOfTab(worldID: String) -> Int? {
+        sessions.firstIndex { $0.worldID == worldID }
+    }
+
+    private func selectTab(worldID: String) {
+        guard let index = indexOfTab(worldID: worldID) else { return }
+        selectTab(at: index)
+    }
+
+    private func closeTab(worldID: String) {
+        guard let index = indexOfTab(worldID: worldID) else { return }
+        closeTab(at: index)
+    }
+
+    func closeTab(at index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        // The last tab isn't closeable — closing it would leave an empty window
+        // with no way to put anything back in it. Close the window instead.
+        guard sessions.count > 1 else { return }
+
+        let session = sessions[index]
+        if session.isConnected {
+            let alert = NSAlert()
+            alert.messageText = "Close “\(session.title)” while connected?"
+            alert.informativeText = "You're still connected. Closing this tab disconnects it and closes its log."
+            alert.addButton(withTitle: "Close Tab")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        // Find the tab again, by identity. `runModal` runs an event loop of its
+        // own, so anything that reshuffles the tabs — a world deleted in
+        // Settings, a window sync — can have happened while the sheet was up,
+        // and the number we came in with may now name a different session
+        // entirely. Everything below uses `current`, never `index`.
+        guard let current = sessions.firstIndex(where: { $0 === session }),
+              sessions.count > 1 else { return }
+
+        let wasActive = (current == activeIndex)
+        session.disconnect()
+        session.isFrontmost = false
+        session.onChange = nil
+        session.view.removeFromSuperview()
+        sessions.remove(at: current)
+
+        if wasActive {
+            // Land on the neighbour, the way every other tabbed app does — the
+            // tab to the left if you closed the last one, otherwise the one
+            // that slid into the gap.
+            selectTab(at: min(current, sessions.count - 1))
+        } else {
+            // A *background* tab went away. Everything to its right just shifted
+            // down one, so the active index has to follow — without this you get
+            // yanked to a different world for closing a tab you weren't even
+            // looking at, and the global world selection follows you there.
+            if current < activeIndex { activeIndex -= 1 }
+            redrawTabs()
+        }
+    }
+
+    /// ⌘W: close the frontmost tab, or the whole window if it's the only one.
+    func closeActiveTab() {
+        if sessions.count > 1 {
+            closeTab(at: activeIndex)
+        } else {
+            window.performClose(nil)
+        }
+    }
+
+    func closeWindow() {
+        window.performClose(nil)
+    }
+
+    private func showActiveSession() {
+        for sub in container.subviews {
+            sub.removeFromSuperview()
+        }
+        for (index, session) in sessions.enumerated() {
+            session.isFrontmost = (index == activeIndex)
+        }
+        guard let session = activeSession else { return }
+
+        let sessionView = session.view
+        sessionView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(sessionView)
+        // Fresh constraints each swap: `removeFromSuperview()` above tore down
+        // the previous set along with the view's place in the hierarchy.
+        NSLayoutConstraint.activate([
+            sessionView.topAnchor.constraint(equalTo: container.topAnchor),
+            sessionView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            sessionView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            sessionView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        window.title = "MacMUSH — \(session.title)"
+        session.focusInput()
+    }
+
+    /// Ask for the bar to be brought up to date, at most once per turn of the
+    /// run loop.
+    ///
+    /// Every session calls this from `onChange`, which fires on every line it
+    /// receives. A couple of busy worlds will ask dozens of times a second, and
+    /// each ask re-solves the bar's layout. Collapsing them costs nothing you
+    /// can see — a MUD line and the badge that counts it land in the same frame
+    /// either way — and takes the layout engine out of the hot path.
+    func refreshTabs() {
+        guard !tabRefreshScheduled else { return }
+        tabRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.tabRefreshScheduled = false
+            self.redrawTabs()
+        }
+    }
+
+    /// Redraw the bar from the sessions, now. Titles, connected dots and unread
+    /// counts all come straight off the sessions, so nothing has to work out
+    /// which tab it was that changed.
+    private func redrawTabs() {
+        let items = sessions.map {
+            TabBarView.Item(id: $0.worldID,
+                            title: $0.title,
+                            isConnected: $0.isConnected,
+                            unread: $0.unread)
+        }
+        tabBar.update(items: items, activeIndex: activeIndex)
+        if let session = activeSession {
+            window.title = "MacMUSH — \(session.title)"
+        }
+    }
+
+    // MARK: The "+" picker
+
+    /// A menu of every saved world, with the ones already open ticked and
+    /// disabled — one world, one tab, app-wide. Also the quickest route to
+    /// making a new world when you want a tab for something you haven't set up.
+    func promptNewTab() {
+        // `popUp` below runs a tracking loop, and a tracking loop runs the main
+        // queue — so a second ⌘T, whose work is deferred by a turn of the run
+        // loop, lands *inside* the first menu and stacks another on top of it.
+        // The flag stays set for as long as the menu is up, because `popUp`
+        // doesn't return until it comes down.
+        guard !pickerPending else { return }
+        pickerPending = true
+        defer { pickerPending = false }
+
+        let menu = NSMenu()
+        // Off, or AppKit's automatic enabling would helpfully re-enable the
+        // already-open worlds right back — this menu's target does implement
+        // their action, it just doesn't want them picked.
+        menu.autoenablesItems = false
+        for world in WorldStore.shared.worlds {
+            let item = menu.addItem(withTitle: world.name,
+                                    action: #selector(pickWorld(_:)),
+                                    keyEquivalent: "")
+            item.target = self
+            item.representedObject = world.id
+            if WindowManager.shared.locate(worldID: world.id) != nil {
+                item.state = .on
+                item.isEnabled = false
             }
         }
-        updateStatus()
+        if !menu.items.isEmpty { menu.addItem(.separator()) }
+        let newItem = menu.addItem(withTitle: "New World…",
+                                   action: #selector(newWorldForTab),
+                                   keyEquivalent: "")
+        newItem.target = self
+
+        // Anchor under the "+", which is where you were already looking whether
+        // you clicked it or pressed ⌘T.
+        let anchor = tabBar.newButtonFrame
+        _ = menu.popUp(positioning: nil,
+                       at: NSPoint(x: anchor.minX, y: anchor.minY - 4),
+                       in: tabBar)
     }
 
-    /// Connect using the saved world's host/port.
-    func connectDefault() {
-        connect(host: config.host, port: config.port)
+    @objc private func pickWorld(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let world = WorldStore.shared.worlds.first(where: { $0.id == id }) else { return }
+        addTab(world: world)
     }
 
-    private func sendConnectText() {
-        for line in config.connectText.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        where !line.trimmingCharacters(in: .whitespaces).isEmpty {
-            send(line, echo: false)
-        }
+    @objc private func newWorldForTab() {
+        guard let name = promptText(title: "New World",
+                                    info: "Name this world. You can set its host and port with ⌘R after its tab opens.",
+                                    defaultValue: "New World"),
+              !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        let world = WorldConfig(name: name)
+        WorldStore.shared.insertWorld(world)
+        addTab(world: world)
     }
 
-    func promptConnect() {
+    private func promptText(title: String, info: String, defaultValue: String) -> String? {
         let alert = NSAlert()
-        alert.messageText = "Connect to a MUD"
-        alert.informativeText = "Enter a host and port (e.g. 127.0.0.1 4000)."
+        alert.messageText = title
+        alert.informativeText = info
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.stringValue = "\(config.host) \(config.port)"
+        field.stringValue = defaultValue
         alert.accessoryView = field
-        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        if alert.runModal() == .alertFirstButtonReturn {
-            let parts = field.stringValue.split { $0 == " " || $0 == ":" }.map(String.init)
-            if parts.count >= 2, let p = UInt16(parts[1]) {
-                connect(host: parts[0], port: p)
-            } else if parts.count == 1, !parts[0].isEmpty {
-                connect(host: parts[0], port: 23)
-            }
-        }
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
-    // MARK: Incoming — line assembly + triggers
+    // MARK: Store changes
 
-    private func render(_ text: String) {
-        for op in ansi.feed(text) {
-            switch op {
-            case .text(let styled):
-                pendingOps.append(op)
-                pendingPlain += styled.text
-            case .newline:
-                flushLine(isPrompt: false)
-            case .bell:
-                NSSound.beep()
-            }
+    /// Push edits from the Worlds window into every tab this window holds, and
+    /// deal with any tab whose world has been deleted out from under it.
+    func syncFromStore() {
+        let worlds = WorldStore.shared.worlds
+        func isOrphan(_ session: Session) -> Bool {
+            !worlds.contains { $0.id == session.worldID }
         }
-    }
 
-    private func flushLine(isPrompt: Bool) {
-        if pendingOps.isEmpty && pendingPlain.isEmpty && isPrompt { return }
-
-        let plain = pendingPlain
-        let lineOps = pendingOps
-        pendingOps = []
-        pendingPlain = ""
-
-        var gagged = false
-        if !isPrompt {
-            let result = Matcher.evaluate(config.triggers, line: plain)
-            gagged = result.gag
-            for match in result.matches where !match.sendText.isEmpty {
-                send(match.sendText, echo: false)
+        for session in sessions {
+            if let world = worlds.first(where: { $0.id == session.worldID }) {
+                session.syncActiveWorld(world)
             }
         }
 
-        if !gagged {
-            renderer.append(lineOps + [.newline], to: textView)
-            textView.scrollToEndOfDocument(nil)
-            // A gagged line stays out of the log too — if a trigger hid it from
-            // you, writing it to disk anyway would be a nasty surprise.
-            logLine(plain)
-        }
-    }
+        guard sessions.contains(where: isOrphan) else { return }
 
-    // MARK: Output helpers
+        // Which tab you were on, held by identity rather than by number — the
+        // removals below shuffle the indices out from under it.
+        let previouslyActive = activeSession
 
-    private func appendSystem(_ message: String) {
-        let color = NSColor(srgbRed: 0.53, green: 0.53, blue: 0.80, alpha: 1)
-        textView.textStorage?.append(renderer.systemLine(message + "\n", color: color))
-        textView.scrollToEndOfDocument(nil)
-        logLine(message)
-    }
-
-    private func appendEcho(_ line: String) {
-        // A MUSH login carries the password on the same line as the character
-        // name, and most servers never negotiate telnet ECHO to hide it. Mask
-        // it here, which is the one funnel every echoed line passes through, so
-        // it reaches neither the scrollback nor the log. What you typed is
-        // still in the history buffer, so ↑ brings the real line back.
-        let shown = "› " + SessionFormat.redactLogin(line)
-        let color = NSColor(srgbRed: 0.91, green: 0.82, blue: 0.38, alpha: 1)
-        textView.textStorage?.append(renderer.systemLine(shown + "\n", color: color))
-        textView.scrollToEndOfDocument(nil)
-        logLine(shown)
-    }
-
-    // MARK: Status bar
-
-    private func updateStatus() {
-        statusLabel.stringValue = isConnected
-            ? "\(config.name)  |  \(currentHost):\(currentPort)"
-            : "Not connected"
-        logBadge.isHidden = !logger.isActive
-        logBadge.toolTip = logger.fileURL?.path
-        updateElapsed()
-    }
-
-    private func updateElapsed() {
-        guard let start = connectedAt else {
-            if !elapsedLabel.stringValue.isEmpty { elapsedLabel.stringValue = "" }
-            return
-        }
-        let text = SessionFormat.elapsed(Date().timeIntervalSince(start))
-        // Only touch the label when the second actually rolls over; assigning
-        // stringValue redraws, and this runs every tick forever.
-        if elapsedLabel.stringValue != text { elapsedLabel.stringValue = text }
-    }
-
-    // MARK: Logging
-
-    private func startLoggingIfEnabled() {
-        guard config.logEnabled else { return }
-        if let problem = logger.start(worldName: config.name,
-                                      host: currentHost,
-                                      port: currentPort,
-                                      directory: config.logDirectory) {
-            appendSystem(problem)
-            return
-        }
-        if let url = logger.fileURL { appendSystem("Logging to \(url.path)") }
-    }
-
-    private func stopLogging() {
-        guard logger.isActive else { return }
-        let url = logger.fileURL
-        logger.stop()
-        if let url = url { appendSystem("Log saved: \(url.path)") }
-    }
-
-    /// Mirror one displayed line into the session log. Safe to call from the
-    /// append helpers: a failed write closes the logger *before* returning the
-    /// warning, so the `appendSystem` below can't recurse back in here.
-    private func logLine(_ text: String) {
-        guard logger.isActive else { return }
-        guard let problem = logger.write(text) else { return }
-        appendSystem(problem)
-        updateStatus()
-    }
-
-    // MARK: Sending
-
-    /// Send one or more lines to the MUD (multi-line text is split on "\n").
-    private func send(_ text: String, echo: Bool) {
-        // `isConnected` as well as the object: when the *server* closes the
-        // link, `connection` stays non-nil — only `disconnect()` clears it — so
-        // checking the object alone would swallow the line and still echo it to
-        // the screen as though it had gone out.
-        guard isConnected, connection != nil else {
-            // Paste twenty lines while disconnected and you want to be told
-            // once, not twenty times.
-            if !warnedNotConnected {
-                warnedNotConnected = true
-                appendSystem("Not connected.")
-            }
-            return
-        }
-        for line in text.components(separatedBy: "\n") {
-            connection?.send(line)
-            if echo && echoOn { appendEcho(line) }
-        }
-    }
-
-    // MARK: Input
-
-    @objc private func sendFromInput() {
-        let raw = inputView.string
-        setInputText("")
-
-        // The whole block goes into history as one entry, so ↑ brings back the
-        // pose you just sent rather than only its last line.
-        if !raw.isEmpty && history.last != raw {
-            history.append(raw)
-            if history.count > 200 { history.removeFirst() }
-        }
-        historyIndex = -1
-        draft = ""
-
-        // Slash commands still work while disconnected, so the block can't be
-        // rejected up front — `send` warns once for the whole batch instead.
-        warnedNotConnected = false
-        for line in raw.components(separatedBy: "\n") { submit(line) }
-    }
-
-    /// Replace everything in the command box without corrupting undo.
-    ///
-    /// Assigning `inputView.string` goes behind the text system's back: the
-    /// undo manager keeps the ranges it recorded while you were typing, and
-    /// replaying one of those against the now-empty storage raises
-    /// NSRangeException — ⌘Z twice after sending a line would kill the app.
-    /// Bracketing the edit the documented way re-points undo at what's there.
-    private func setInputText(_ text: String) {
-        let all = NSRange(location: 0, length: (inputView.string as NSString).length)
-        guard inputView.shouldChangeText(in: all, replacementString: text) else { return }
-        inputView.textStorage?.replaceCharacters(in: all, with: text)
-        // A storage-level replace doesn't pick up typing attributes, so a
-        // recalled line would otherwise come back in the system font.
-        if !text.isEmpty {
-            inputView.textStorage?.setAttributes(
-                inputView.typingAttributes,
-                range: NSRange(location: 0, length: (text as NSString).length))
-        }
-        inputView.didChangeText()
-    }
-
-    /// One line of what the user typed: a slash command, an alias, or plain text
-    /// straight to the MUD.
-    private func submit(_ line: String) {
-        if line.hasPrefix("/") {
-            handleCommand(line)
-            return
+        // Close the orphaned tabs, but a window has to keep at least one, so
+        // stop before emptying it. Backwards, so removing doesn't shift the
+        // indices still to come.
+        for index in sessions.indices.reversed() where sessions.count > 1 {
+            let session = sessions[index]
+            guard isOrphan(session) else { continue }
+            session.disconnect()
+            session.isFrontmost = false
+            session.onChange = nil
+            session.view.removeFromSuperview()
+            sessions.remove(at: index)
         }
 
-        let result = Matcher.evaluate(config.aliases, line: line)
-        if result.matches.isEmpty {
-            send(line, echo: true)
-        } else {
-            if echoOn { appendEcho(line) }
-            for match in result.matches where !match.sendText.isEmpty {
-                send(match.sendText, echo: false)
-            }
-        }
-    }
-
-    /// The MUD asked us to stop echoing — it's collecting a password. The typed
-    /// text isn't masked (you still need to see your own typos), but nothing is
-    /// echoed to the scrollback, which also keeps it out of the session log.
-    private func setEcho(_ on: Bool) {
-        echoOn = on
-        promptLabel.stringValue = on ? "›" : "•"
-        promptLabel.textColor = on ? .tertiaryLabelColor : .systemOrange
-        promptLabel.toolTip = on ? nil : "Password mode — this line won't be echoed or logged."
-    }
-
-    // MARK: Key handling in the command box
-
-    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        guard textView === inputView else { return false }
-
-        switch commandSelector {
-        case #selector(NSResponder.insertNewline(_:)):
-            sendFromInput()
-            return true
-
-        case #selector(NSResponder.insertLineBreak(_:)),
-             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            // Shift-Return and Option-Return. AppKit's own insertLineBreak puts
-            // in U+2028, which would go down the socket as a stray character —
-            // insert a real newline instead.
-            textView.insertText("\n", replacementRange: textView.selectedRange)
-            return true
-
-        case #selector(NSResponder.moveUp(_:)):
-            // Only walk history from the top line, so the arrows still move the
-            // caret normally inside a multi-line pose.
-            guard caretOnFirstLine else { return false }
-            recallHistory(delta: -1)
-            return true
-
-        case #selector(NSResponder.moveDown(_:)):
-            // Nothing below the line you're still writing, so hand ↓ back to
-            // AppKit rather than swallowing it — the caret should still move to
-            // the end of the text the way it does in every other text view.
-            guard caretOnLastLine, historyIndex != -1 else { return false }
-            recallHistory(delta: 1)
-            return true
-
-        default:
-            return false
-        }
-    }
-
-    // MARK: Timers
-
-    private func armTimers() {
-        let now = Date()
-        timerFireDates.removeAll()
-        for timer in config.timers where timer.enabled {
-            timerFireDates[timer.id] = now.addingTimeInterval(timer.seconds)
-        }
-    }
-
-    /// Keep the fire-date table in step with the current timer list after an
-    /// edit: newly enabled timers start counting now, removed or disabled ones
-    /// are forgotten, and timers already counting down keep their place.
-    private func reconcileTimers() {
-        guard isConnected else {
-            timerFireDates.removeAll()
-            return
-        }
-        let now = Date()
-        var live: [String: Date] = [:]
-        for timer in config.timers where timer.enabled {
-            live[timer.id] = timerFireDates[timer.id] ?? now.addingTimeInterval(timer.seconds)
-        }
-        timerFireDates = live
-    }
-
-    private func startTicker() {
-        tickTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        // .common, not the default mode: otherwise the connected-time clock
-        // freezes — and every world timer stops firing — for as long as a menu
-        // is held open, a panel is up, or the window is being live-resized.
-        RunLoop.main.add(timer, forMode: .common)
-        tickTimer = timer
-    }
-
-    private func stopTicker() {
-        tickTimer?.invalidate()
-        tickTimer = nil
-    }
-
-    private func tick() {
-        guard isConnected else { return }
-        updateElapsed()
-        let now = Date()
-        var changed = false
-        for timer in config.timers where timer.enabled {
-            guard let fire = timerFireDates[timer.id], fire <= now else { continue }
-            if !timer.sendText.isEmpty { send(timer.sendText, echo: false) }
-            if timer.oneShot {
-                if let idx = config.timers.firstIndex(where: { $0.id == timer.id }) {
-                    config.timers[idx].enabled = false
-                }
-                timerFireDates[timer.id] = nil
-                changed = true
+        // If the survivor is itself an orphan it can't sit there showing a world
+        // that no longer exists. Move it to a world nobody else has open — going
+        // to whatever the store happens to have selected, as the single-window
+        // version did, would usually land on a world that's already in a tab
+        // somewhere, and two tabs on one world means two sockets logging in as
+        // the same character and two loggers appending to the same file.
+        if sessions.count == 1, let survivor = sessions.first, isOrphan(survivor) {
+            if let replacement = WindowManager.shared.firstUnopenedWorld() {
+                survivor.activate(world: replacement)
             } else {
-                timerFireDates[timer.id] = now.addingTimeInterval(timer.seconds)
+                // Every remaining world is open elsewhere, so this window has
+                // nothing left to show. `close()` rather than `performClose` —
+                // there's no sense asking "close while connected?" about a world
+                // that no longer exists.
+                survivor.disconnect()
+                window.close()
+                return
             }
         }
-        if changed { saveConfig() }
-    }
 
-    // MARK: Persistence
+        // Is this the window the menu bar is talking about? The store's
+        // selection is one app-wide value, and this method runs in *every*
+        // window — so without a test, whichever window the sync loop happens to
+        // reach last re-points the current world at its own front tab, and the
+        // Rename / Delete Current World you then run in the window you're
+        // actually using acts on a world two monitors away. Visit order is no
+        // way to decide what ⌘-Delete deletes.
+        //
+        // `isKeyWindow` is the tempting test and the wrong one. Worlds are
+        // deleted from the Settings window, and while Settings is key *no* world
+        // window is — so it would gate this off in precisely the case it exists
+        // for, leaving the store naming one world while the last-used window
+        // shows another. `activeWindow` is the same question the menu commands
+        // themselves ask: the key window if there is one, otherwise the window
+        // you were last using. At most one window can match, so the answer
+        // doesn't depend on visit order either.
+        let isCurrent = (WindowManager.shared.activeWindow === self)
 
-    /// Save by id rather than "whichever world is selected": the Worlds window
-    /// can move the selection around while this window stays on its own world,
-    /// and a slash command here must never land in someone else's config.
-    private func saveConfig() {
-        WorldStore.shared.update(config)
-    }
-
-    // MARK: Slash commands
-
-    private enum RuleKind { case trigger, alias }
-
-    private func handleCommand(_ raw: String) {
-        let body = String(raw.dropFirst())
-        let spaceIdx = body.firstIndex(of: " ")
-        let cmd = (spaceIdx.map { String(body[..<$0]) } ?? body).lowercased()
-        let rest = spaceIdx.map { String(body[body.index(after: $0)...]) } ?? ""
-
-        switch cmd {
-        case "help", "?":
-            showHelp()
-        case "connect":
-            let parts = rest.split { $0 == " " || $0 == ":" }.map(String.init)
-            if parts.count >= 2, let p = UInt16(parts[1]) { connect(host: parts[0], port: p) }
-            else { connectDefault() }
-        case "disconnect":
-            disconnect()
-            appendSystem("Disconnected.")
-        case "alias":
-            addRule(rest, kind: .alias)
-        case "trigger":
-            addRule(rest, kind: .trigger)
-        case "timer":
-            addTimer(rest)
-        case "aliases":
-            listRules(config.aliases, label: "Aliases")
-        case "triggers":
-            listRules(config.triggers, label: "Triggers")
-        case "timers":
-            listTimers()
-        case "rmalias":
-            removeRule(rest, kind: .alias)
-        case "rmtrigger":
-            removeRule(rest, kind: .trigger)
-        case "rmtimer":
-            removeTimer(rest)
-        default:
-            appendSystem("Unknown command: /\(cmd). Type /help.")
-        }
-    }
-
-    private func addRule(_ spec: String, kind: RuleKind) {
-        guard let eq = spec.firstIndex(of: "=") else {
-            appendSystem("Usage: /\(kind == .alias ? "alias" : "trigger") <pattern>=<send>")
-            return
-        }
-        let pattern = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
-        let sendText = String(spec[spec.index(after: eq)...])
-        guard !pattern.isEmpty else { appendSystem("Pattern can't be empty."); return }
-        let rule = MatchRule(pattern: pattern, sendText: sendText)
-        if kind == .alias { config.aliases.append(rule) } else { config.triggers.append(rule) }
-        saveConfig()
-        // Redacted for the same reason a typed login is: `/alias in=connect Rob
-        // hunter2` is a perfectly ordinary thing to set up, and echoing it back
-        // verbatim would write the password straight into the session log.
-        appendSystem("Added \(kind == .alias ? "alias" : "trigger"): \(pattern)  →  \(SessionFormat.redactBlock(sendText))")
-    }
-
-    private func addTimer(_ spec: String) {
-        guard let eq = spec.firstIndex(of: "=") else {
-            appendSystem("Usage: /timer <seconds>=<send>")
-            return
-        }
-        let secStr = String(spec[..<eq]).trimmingCharacters(in: .whitespaces)
-        let sendText = String(spec[spec.index(after: eq)...])
-        // isFinite matters: Double("inf") parses, and JSONEncoder refuses to
-        // encode a non-finite Double. One `/timer inf=look` would make every
-        // future save in the app fail silently, forever.
-        guard let seconds = Double(secStr), seconds.isFinite, seconds > 0, seconds <= 31_536_000 else {
-            appendSystem("Seconds must be a positive number (up to 31536000).")
-            return
-        }
-        let timer = MudTimer(seconds: seconds, sendText: sendText)
-        config.timers.append(timer)
-        if isConnected { timerFireDates[timer.id] = Date().addingTimeInterval(seconds) }
-        saveConfig()
-        appendSystem("Added timer: every \(secStr)s  →  \(SessionFormat.redactBlock(sendText))")
-    }
-
-    private func listRules(_ rules: [MatchRule], label: String) {
-        guard !rules.isEmpty else { appendSystem("\(label): (none)"); return }
-        appendSystem("\(label):")
-        for (i, r) in rules.enumerated() {
-            let flags = (r.enabled ? "" : " [off]") + (r.gag ? " [gag]" : "") + (r.isRegex ? " [regex]" : "")
-            appendSystem("  \(i + 1). \(r.pattern)  →  \(SessionFormat.redactBlock(r.sendText))\(flags)")
-        }
-    }
-
-    private func listTimers() {
-        guard !config.timers.isEmpty else { appendSystem("Timers: (none)"); return }
-        appendSystem("Timers:")
-        for (i, t) in config.timers.enumerated() {
-            let flags = (t.enabled ? "" : " [off]") + (t.oneShot ? " [once]" : "")
-            appendSystem("  \(i + 1). every \(t.seconds)s  →  \(SessionFormat.redactBlock(t.sendText))\(flags)")
-        }
-    }
-
-    private func removeRule(_ arg: String, kind: RuleKind) {
-        guard let n = Int(arg.trimmingCharacters(in: .whitespaces)), n >= 1 else {
-            appendSystem("Usage: /rm\(kind == .alias ? "alias" : "trigger") <number>")
-            return
-        }
-        if kind == .alias {
-            guard n <= config.aliases.count else { appendSystem("No alias #\(n)."); return }
-            appendSystem("Removed alias: \(config.aliases.remove(at: n - 1).pattern)")
+        // Stay on the tab you were on if it's still here; otherwise fall back to
+        // whatever now occupies the old slot.
+        if let previous = previouslyActive,
+           let index = sessions.firstIndex(where: { $0 === previous }) {
+            activeIndex = index
+            redrawTabs()
+            // The *session* survived, but the world inside it may not have: an
+            // orphaned survivor was re-pointed at a replacement a few lines up,
+            // and the store still names the world the tab used to show. Worlds ▸
+            // Rename / Delete Current World would then quietly act on that one —
+            // editing or destroying a world you aren't looking at.
+            if isCurrent { WorldStore.shared.select(id: previous.worldID) }
         } else {
-            guard n <= config.triggers.count else { appendSystem("No trigger #\(n)."); return }
-            appendSystem("Removed trigger: \(config.triggers.remove(at: n - 1).pattern)")
+            // The claim has to be passed down, not left to `selectTab`: its
+            // default is "the user asked for this", and this is the one caller
+            // where that isn't true.
+            selectTab(at: min(activeIndex, sessions.count - 1),
+                      claimingCurrentWorld: isCurrent)
         }
-        saveConfig()
     }
 
-    private func removeTimer(_ arg: String) {
-        guard let n = Int(arg.trimmingCharacters(in: .whitespaces)), n >= 1, n <= config.timers.count else {
-            appendSystem("Usage: /rmtimer <number>")
-            return
+    /// Shut every session down cleanly — sockets closed, log footers written.
+    func disconnectAll() {
+        for session in sessions { session.disconnect() }
+    }
+
+    var hasConnectedSession: Bool {
+        sessions.contains { $0.isConnected }
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        WindowManager.shared.windowBecameKey(self)
+        // Coming back to a window re-asserts its frontmost tab as the current
+        // world, so the Worlds menu tick follows the window you're using.
+        if let session = activeSession {
+            WorldStore.shared.select(id: session.worldID)
         }
-        let removed = config.timers.remove(at: n - 1)
-        timerFireDates[removed.id] = nil
-        saveConfig()
-        appendSystem("Removed timer: every \(removed.seconds)s")
     }
 
-    private func showHelp() {
-        let lines = [
-            "Commands (rules are saved between sessions):",
-            "  /connect [host port]        connect (defaults to saved world)",
-            "  /disconnect",
-            "  /alias <pattern>=<send>     e.g.  /alias gt * *=give %2 to %1",
-            "  /trigger <pattern>=<send>   e.g.  /trigger * tells you *=wave",
-            "  /timer <seconds>=<send>     e.g.  /timer 60=look",
-            "  /aliases  /triggers  /timers    list them",
-            "  /rmalias N  /rmtrigger N  /rmtimer N    remove by number",
-            "  Use * as a wildcard; %1..%9 insert wildcards into the send text.",
-        ]
-        for line in lines { appendSystem(line) }
+    /// Going full screen takes the traffic lights away and coming back brings
+    /// them back, so the tabs have to give up the corner and reclaim it. Both
+    /// are the same line: `trafficLightInset` already knows which state it's in.
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        tabBar.leadingInset = trafficLightInset
     }
 
-    // MARK: History (arrow keys)
-
-    /// True when there is no newline anywhere before the caret — i.e. pressing ↑
-    /// would leave the box entirely. Only then does ↑ mean "previous command";
-    /// inside a multi-line pose it has to keep meaning "up one line".
-    private var caretOnFirstLine: Bool {
-        let text = inputView.string as NSString
-        let caret = inputView.selectedRange.location
-        guard caret != NSNotFound, caret <= text.length else { return true }
-        return text.range(of: "\n", options: .backwards,
-                          range: NSRange(location: 0, length: caret)).location == NSNotFound
+    func windowDidExitFullScreen(_ notification: Notification) {
+        tabBar.leadingInset = trafficLightInset
     }
 
-    private var caretOnLastLine: Bool {
-        let text = inputView.string as NSString
-        let end = NSMaxRange(inputView.selectedRange)
-        guard end <= text.length else { return true }
-        return text.range(of: "\n", range: NSRange(location: end,
-                                                   length: text.length - end)).location == NSNotFound
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard hasConnectedSession else { return true }
+        let live = sessions.filter { $0.isConnected }.map { $0.title }
+        let alert = NSAlert()
+        alert.messageText = live.count == 1
+            ? "Close this window while connected to “\(live[0])”?"
+            : "Close this window while connected to \(live.count) worlds?"
+        alert.informativeText = live.count == 1
+            ? "Closing disconnects and closes the session log."
+            : "Closing disconnects \(live.joined(separator: ", ")) and closes their session logs."
+        alert.addButton(withTitle: "Close")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func recallHistory(delta: Int) {
-        guard !history.isEmpty else { return }
-        // ↓ from a line you're still writing has nowhere further down to go.
-        // Without this it would stash the draft, come straight back to it, and
-        // yank the caret to the end of what you were in the middle of typing.
-        guard delta < 0 || historyIndex != -1 else { return }
-
-        if historyIndex == -1 {
-            // Stash whatever was half-typed so walking back down returns it.
-            draft = inputView.string
-            historyIndex = history.count
+    func windowWillClose(_ notification: Notification) {
+        disconnectAll()
+        for session in sessions {
+            session.isFrontmost = false
+            session.onChange = nil
         }
-        historyIndex = max(0, min(history.count, historyIndex + delta))
-
-        let text: String
-        if historyIndex >= history.count {
-            historyIndex = -1
-            text = draft
-        } else {
-            text = history[historyIndex]
-        }
-        setInputText(text)
-        // Caret to the very end: for a multi-line entry that also means the next
-        // ↑ walks up through the recalled text before reaching further back.
-        let end = NSRange(location: (text as NSString).length, length: 0)
-        inputView.selectedRange = end
-        inputView.scrollRangeToVisible(end)
+        WindowManager.shared.windowClosed(self)
     }
 }
 #endif
