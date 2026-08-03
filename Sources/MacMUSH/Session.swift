@@ -39,6 +39,54 @@ private final class InputPaneView: NSView {
     }
 }
 
+/// A clip view that refuses to scroll sideways.
+///
+/// Neither of this window's text views wraps at a width of its own choosing —
+/// both are meant to wrap at exactly the width they're being shown at, so there
+/// is never anything off to the right worth scrolling to. Any horizontal offset
+/// is therefore a bug by definition, and this is where it gets caught, because
+/// it's the one place *every* route to one has to pass through: a two-finger
+/// swipe, a `scrollRectToVisible` for a glyph that a half-finished re-layout
+/// still thinks is off-screen, or an autoresize that briefly leaves the document
+/// wider than the space it's in.
+///
+/// Overriding this rather than snapping the offset back afterwards matters:
+/// `constrainBoundsRect` runs *before* the scroll is committed, so the bad
+/// offset is never drawn, not drawn and then corrected. Vertical scrolling —
+/// including the elastic overscroll at the ends — is left entirely to `super`.
+private final class VerticalOnlyClipView: NSClipView {
+    /// Set the first time a sideways scroll actually has to be blocked, so the
+    /// complaint below is printed once per view instead of once per frame.
+    private var hasReportedSidewaysScroll = false
+
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var constrained = super.constrainBoundsRect(proposedBounds)
+
+        // Say something the one time this fires, because otherwise this class is
+        // indistinguishable from a fix. `super` only hands back a nonzero x when
+        // the document really is wider than the clip showing it — which, given
+        // `syncWidth` is supposed to guarantee they're the same width, should
+        // never happen. Neither scroll view has a horizontal scroller, so if it
+        // *does* happen, the text off to the right is now unreachable rather
+        // than merely awkward, and the symptom changes from "the left edge is
+        // chopped" to "the right edge is missing" with nothing to show for it.
+        // This line is that something.
+        if abs(constrained.origin.x) > 0.5, !hasReportedSidewaysScroll {
+            hasReportedSidewaysScroll = true
+            let document = documentView?.frame.width ?? -1
+            NSLog("""
+                MacMUSH: blocked a sideways scroll to x=\(constrained.origin.x.rounded()). \
+                The document is \(document.rounded())pt wide inside a \
+                \(bounds.width.rounded())pt clip — those should match. \
+                Text may be cut off at the right-hand edge; please report this.
+                """)
+        }
+
+        constrained.origin.x = 0
+        return constrained
+    }
+}
+
 /// One world's live session: scrollback text view, command input, status line,
 /// and the connection wiring. Code-only AppKit — no storyboards.
 ///
@@ -162,6 +210,14 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         super.init()
 
         // --- output text view inside a scroll view ---
+        // First, before anything else touches the scroll view. Two reasons, and
+        // the second is the load-bearing one. `backgroundColor` and
+        // `drawsBackground` are handed straight down to whichever clip view is
+        // installed when they're set, so swapping the clip view afterwards would
+        // put a fresh one in place still carrying its own default grey. And
+        // `documentView` is installed *into* the clip view, so replacing the
+        // clip view after assigning it would take the text view back out again.
+        scrollView.contentView = VerticalOnlyClipView()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = false
         scrollView.borderType = .noBorder
@@ -182,12 +238,20 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         textView.drawsBackground = true
         textView.backgroundColor = renderer.background
         textView.textContainerInset = NSSize(width: 8, height: 6)
+        // Only the height here is doing anything lasting: unbounded, so the text
+        // keeps flowing instead of stopping at the bottom of the first screenful.
+        // The width is a starting value that `widthTracksTextView` below
+        // immediately takes ownership of and recomputes — don't try to keep it
+        // accurate, and don't read it as the wrap width. The wrap width is the
+        // text view's frame, which is what `syncWidth` exists to pin down.
         textView.textContainer?.size = NSSize(width: textView.frame.width,
                                               height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
         scrollView.documentView = textView
 
         // --- input: a real text view, so it wraps and can be resized ---
+        // Clip view first, for the same two reasons as the scrollback above.
+        inputScroll.contentView = VerticalOnlyClipView()
         inputScroll.hasVerticalScroller = true
         inputScroll.autohidesScrollers = true
         inputScroll.borderType = .noBorder
@@ -251,6 +315,19 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(inputClipResized(_:)),
             name: NSView.frameDidChangeNotification, object: inputScroll.contentView)
+
+        // And the same for the scrollback, which needs it for a different
+        // reason: not to stay clickable, but to stay the width of the window it
+        // is being shown in. See `syncWidth`.
+        scrollView.contentView.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(outputClipResized(_:)),
+            name: NSView.frameDidChangeNotification, object: scrollView.contentView)
+        // Both of those name a particular clip view rather than listening to
+        // every view in the app, so each is bound to whichever object is the
+        // content view at this moment. That's the replacement installed at the
+        // top of `init` and never swapped again — which is the reason the
+        // replacing has to happen up there and not somewhere later on.
     }
 
     deinit {
@@ -272,6 +349,14 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         splitView.dividerStyle = .thin
         scrollView.frame = NSRect(x: 0, y: 0, width: 884, height: 452)
         inputPane.frame = NSRect(x: 0, y: 0, width: 884, height: 76)
+        // Setting that frame tiled the scroll view, so its clip view has a real
+        // width for the first time — and a text view handed to a scroll view
+        // that was still zero-sized is exactly the starting point `syncWidth`
+        // exists to correct. Do it here, while there's a number to copy, rather
+        // than in `init` where there wasn't one yet. If the split view has since
+        // squashed the scroll view back to nothing this is a no-op and the
+        // frame-change notification picks it up instead; no harm either way.
+        syncWidth(of: textView, in: scrollView)
         splitView.addSubview(scrollView)
         splitView.addSubview(inputPane)
         // Set last: a saved divider position needs subviews to restore onto.
@@ -369,7 +454,75 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     }
 
     @objc private func inputClipResized(_ note: Notification) {
+        // Width before height: `syncInputMinHeight` sizes the box to fit its
+        // text, and how many lines that text takes depends on how wide it is.
+        //
+        // Both of these can re-enter: `inputScroll` autohides its scroller, so
+        // changing the content height can add or remove a scroller, which
+        // re-tiles, which lands back here. It terminates — a narrower box never
+        // needs *fewer* lines, so the scroller can only appear, and only once —
+        // but the inner pass can read a clip height mid-tile and set a minimum
+        // that's a few points off for one frame. Harmless, and worth knowing
+        // about before adding anything heavier to this method.
+        syncWidth(of: inputView, in: inputScroll)
         syncInputMinHeight()
+    }
+
+    @objc private func outputClipResized(_ note: Notification) {
+        syncWidth(of: textView, in: scrollView)
+    }
+
+    /// Keep a text view exactly as wide as the clip view showing it.
+    ///
+    /// Which is what the autoresizing mask is for, and mostly manages. Mostly:
+    /// autoresizing works in *deltas*, so it only stays right if it started
+    /// right, and neither of these views did. A text view here is handed to its
+    /// scroll view while that scroll view is still zero-sized, so the first real
+    /// resize adds the window's whole width as a delta on top of a frame that
+    /// was already about that wide, and the view can come out close to twice the
+    /// width it should be. Because the container tracks the view, that oversized
+    /// frame *is* the width the text wraps at — hence long lines running off the
+    /// right-hand edge instead of wrapping, and hence, once anything scrolls
+    /// across to reach them, the first character or two chopped off the left.
+    ///
+    /// So state the width outright whenever the clip view changes size, instead
+    /// of trusting that a chain of deltas still adds up. The autoresizing mask
+    /// is deliberately left in place: it runs first and this runs second, so the
+    /// absolute value wins either way, and if this notification ever stops
+    /// arriving the result is a stale wrap width rather than a text view frozen
+    /// at its initial size. The duplicated work costs almost nothing, because
+    /// `NSLayoutManager` lays glyphs out lazily and two invalidations in a row
+    /// are still only one re-wrap.
+    ///
+    /// This is half the fix. It does not explain the part where resizing a
+    /// second time *corrects* the display, and the likeliest explanation for
+    /// that half is a different one: re-wrapping is lazy, so between the
+    /// container's width changing and the glyphs actually moving there's a
+    /// window in which `scrollToEndOfDocument` — called on every single line
+    /// arriving from the MUD — asks for a glyph the stale layout still thinks is
+    /// off to the right, and gets scrolled there. Nothing re-constrains the clip
+    /// afterwards, so the offset sticks until the next resize knocks it back.
+    /// `VerticalOnlyClipView` is the other half, and covers that case whatever
+    /// the width happens to be doing.
+    ///
+    /// One known rough edge: the height passed through here is the view's
+    /// current one, which is stale for as long as the re-wrap is outstanding, so
+    /// a resize while scrolled well back in the history can shift your position
+    /// a little. It settles as soon as layout catches up.
+    private func syncWidth(of text: NSTextView, in scroll: NSScrollView) {
+        let width = scroll.contentView.bounds.width
+        // `> 1` and not `> 0`: during teardown and before the first layout the
+        // clip view measures zero, and snapping a text view to nothing there
+        // would throw away the wrap it's about to be given properly.
+        //
+        // And a half-point of tolerance rather than `!=`, because these are
+        // floating-point numbers arrived at by different routes — a backing-store
+        // rounding of the same width shouldn't re-wrap the whole scrollback.
+        guard width > 1, abs(text.frame.width - width) > 0.5 else { return }
+        // Height unchanged: the layout manager owns it. Changing the width
+        // re-wraps the text, and the view grows or shrinks to fit the result on
+        // its own — `isVerticallyResizable` is what asks for that.
+        text.setFrameSize(NSSize(width: width, height: text.frame.height))
     }
 
     /// Make the whole command box a click target rather than only the lines
