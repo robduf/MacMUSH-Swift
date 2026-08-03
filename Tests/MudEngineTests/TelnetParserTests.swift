@@ -72,6 +72,44 @@ final class TelnetParserTests {
         XCTAssertEqual(Array(data), [104, 105, 13, 10])
     }
 
+    /// The two bytes are the wire format, so they are worth pinning. 241 is NOP
+    /// in RFC 854; a typo here would be a keep-alive that reads as some other
+    /// telnet command entirely.
+    func testEncodeNoOperationIsIACNOP() {
+        XCTAssertEqual(Array(TelnetParser().encodeNoOperation()), [255, 241])
+    }
+
+    /// The half that matters more than the byte values: a NOP has to be silent.
+    /// If it reached `onText` the keep-alive would put a smudge in the output
+    /// window once a minute, and in the log with it.
+    func testIncomingNoOperationProducesNoTextOrPrompt() {
+        let p = TelnetParser()
+        var text = ""
+        var prompts = 0
+        p.onText = { text += $0 }
+        p.onPrompt = { prompts += 1 }
+
+        // Fed either side of a NOP, and split mid-word, because that is how it
+        // will really arrive — the server's own keep-alive can land in the middle
+        // of a line and must not break it in two.
+        p.feed(Data("Hel".utf8))
+        p.feed(TelnetParser().encodeNoOperation())
+        p.feed(Data("lo\r\n".utf8))
+
+        XCTAssertEqual(text, "Hello\r\n")
+        XCTAssertEqual(prompts, 0)
+    }
+
+    /// Nothing is written back in answer to one, either. A NOP that provoked a
+    /// reply would have two clients volleying at each other forever.
+    func testNoOperationIsNotRepliedTo() {
+        let p = TelnetParser()
+        var sent: [UInt8] = []
+        p.onSend = { sent += Array($0) }
+        p.feed(TelnetParser().encodeNoOperation())
+        XCTAssertTrue(sent.isEmpty)
+    }
+
     func testUTF8IncrementalHoldsPartial() {
         var dec = UTF8Incremental()
         let euro = Array("€".utf8)   // 3 bytes: E2 82 AC
@@ -91,6 +129,9 @@ extension TelnetParserTests {
         ("testEchoSuppression", { TelnetParserTests().testEchoSuppression() }),
         ("testGAPromptFlushesText", { TelnetParserTests().testGAPromptFlushesText() }),
         ("testEncodeLineEscapesIACAndAddsCRLF", { TelnetParserTests().testEncodeLineEscapesIACAndAddsCRLF() }),
+        ("testEncodeNoOperationIsIACNOP", { TelnetParserTests().testEncodeNoOperationIsIACNOP() }),
+        ("testIncomingNoOperationProducesNoTextOrPrompt", { TelnetParserTests().testIncomingNoOperationProducesNoTextOrPrompt() }),
+        ("testNoOperationIsNotRepliedTo", { TelnetParserTests().testNoOperationIsNotRepliedTo() }),
         ("testUTF8IncrementalHoldsPartial", { TelnetParserTests().testUTF8IncrementalHoldsPartial() }),
     ])
 }

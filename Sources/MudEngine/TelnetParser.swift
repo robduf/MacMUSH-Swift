@@ -196,6 +196,32 @@ public final class TelnetParser {
         return Data(out)
     }
 
+    /// `IAC NOP` — two bytes that mean nothing whatsoever.
+    ///
+    /// Sent on a timer so the connection is not quietly forgotten by something in
+    /// the middle of it. A home router or a carrier NAT keeps one table entry per
+    /// connection and evicts the ones it has seen no traffic on, and it does that
+    /// without telling either end: the socket still looks open from here and from
+    /// the server both, and the next thing written to it comes back as a reset.
+    /// That is the shape of the fault — no warning, silence, then ECONNRESET on
+    /// the first thing you type.
+    ///
+    /// NOP rather than a blank line or a real command because RFC 854 defines it
+    /// as "no operation", and a server discards it in its telnet layer before the
+    /// game is ever shown it. So it is never mistaken for input: nothing you did
+    /// not type is ever parsed, echoed, or logged. Idle time is the softer claim
+    /// of the two. On a server that dates idle from the last command parsed, this
+    /// leaves it alone; some codebases stamp the descriptor in the socket read
+    /// instead, before any telnet processing, and on those a NOP does reset it.
+    /// A command on a timer would keep the connection up as well, and would also
+    /// be a lie told to everyone running `+who`.
+    ///
+    /// Returned rather than pushed through `onSend`, matching `encodeLine`: the
+    /// caller owns the timer, so the caller should own the write.
+    public func encodeNoOperation() -> Data {
+        Data([IAC, NOP])
+    }
+
     public func sendWindowSize(cols: Int, rows: Int) {
         windowSize = (cols, rows)
         guard weWill.contains(OPT_NAWS) else { return }
