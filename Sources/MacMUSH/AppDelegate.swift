@@ -133,8 +133,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenu.addItem(.separator())
-        // ⌘K. Free, unlike ⌘1…⌘9 — those are the Worlds menu — and unlike the
-        // dozen combinations File and Edit already hold.
+        // ⌘K. Free, unlike ⌘1…⌘9 — those go to the tabs — and unlike the dozen
+        // combinations File and Edit already hold.
         let macrosItem = windowMenu.addItem(withTitle: "Macros",
                                             action: #selector(toggleMacroPalette),
                                             keyEquivalent: "k")
@@ -144,9 +144,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // ⌃⇥ and ⌃⇧⇥, the pair Safari and Chrome already use for this.
         //
         // Not bare ⇥ or ⇧⇥: the command box has both, for completing a word from
-        // what's on screen. And not ⌘1…⌘9 either — the Worlds menu holds those,
-        // and they mean a different thing anyway (a named *world*, wherever its
-        // tab happens to be, rather than a position in this window).
+        // what's on screen. ⌘1…⌘9 go to tabs as well, but by position rather than
+        // by which one you're on, and they are handled entirely in the monitor
+        // with nothing in a menu — see `selectNumberedTab(for:)` for why.
         //
         // These are the captions. The key presses themselves are caught by the
         // monitor in `installKeyMonitor`, which matches the physical key code;
@@ -180,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     /// Rebuild the Worlds menu from the store: one checkable item per world
-    /// (⌘1…⌘9 for the first nine), then add / rename / delete actions. The tick
+    /// (⌃1…⌃9 for the first nine), then add / rename / delete actions. The tick
     /// marks the world in the frontmost tab.
     private func rebuildWorldsMenu() {
         guard let menu = worldsMenu else { return }
@@ -191,6 +191,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         for (i, world) in store.worlds.enumerated() {
             let key = i < 9 ? "\(i + 1)" : ""
             let item = menu.addItem(withTitle: world.name, action: #selector(switchWorld(_:)), keyEquivalent: key)
+            // ⌃, not ⌘. ⌘1…⌘9 are the tabs across the top of the front window,
+            // which is what you can see and what anything else with tabs numbers
+            // with them. These number the *saved worlds* instead, in the order
+            // they were made — a different list, and one where picking a world
+            // with no tab yet opens a new tab for it. That is the point of them,
+            // and it is not what you want to happen when you meant to go back to
+            // the first tab. See `selectNumberedTab(for:)`.
+            //
+            // Set on the item afterwards rather than passed in, because
+            // `addItem(withTitle:action:keyEquivalent:)` takes no modifier
+            // argument and `NSMenuItem`'s mask starts out as ⌘.
+            //
+            // ⌃1…⌃9 are worth knowing about: macOS has its own claim on them for
+            // Mission Control's "Switch to Desktop N". Off unless you've turned
+            // them on, and there is one row per desktop you actually have, so
+            // most people never see them — but the system takes them before any
+            // application does, before a local event monitor even, so if one of
+            // these does nothing that is where it went. System Settings ▸
+            // Keyboard ▸ Keyboard Shortcuts ▸ Mission Control is where it comes
+            // back from.
+            if i < 9 { item.keyEquivalentModifierMask = [.control] }
             item.target = self
             item.representedObject = world.id
             item.state = (world.id == selectedID) ? .on : .off
@@ -238,7 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     /// Watch every key press for one a macro in the frontmost world has claimed,
-    /// or for the two that move between that window's tabs.
+    /// or for one of the ones that move between that window's tabs.
     ///
     /// A local monitor rather than the responder chain, because a monitor sees
     /// the event *before* the main menu gets to claim its key equivalents. That
@@ -263,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             // a macro to ⌃⇥ has said so more recently than this file did.
             if self.runMacro(for: event) { return nil }
             if self.switchTab(for: event) { return nil }
+            if self.selectNumberedTab(for: event) { return nil }
             return event
         }
     }
@@ -359,6 +381,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return true
     }
 
+    /// Whether this key press was ⌘1…⌘9 — and if so, having gone to that tab.
+    ///
+    /// A *position in the front window*, which is what every browser on the
+    /// machine means by ⌘1 and what these used not to mean here. (Not every
+    /// app: Finder puts view modes on ⌘1…⌘4, Mail puts mailboxes there. But
+    /// tabs across the top of a window is the thing this is, and where anything
+    /// has tabs it numbers them.) They were on the Worlds menu,
+    /// numbering the saved worlds in the order they were made — so ⌘1 meant "the
+    /// first world I ever set up", in no particular relation to the tabs on
+    /// screen, and picking one with no tab open yet opened a *new tab* for it.
+    /// Ask for the first tab, get a fourth tab on a world you weren't thinking
+    /// about; and since selecting a tab names the current world, Worlds ▸ Rename
+    /// and Delete Current World then pointed at it too. The worlds keep their
+    /// numbers, one modifier over — see `rebuildWorldsMenu`. Those stayed a menu
+    /// key equivalent rather than moving in here, so they don't get the shift
+    /// tolerance below: a menu matches its modifier mask exactly.
+    ///
+    /// Matched on the character rather than the key code, which is the opposite
+    /// of `switchTab` above and for the opposite reason: a digit has only the one
+    /// spelling, so there is nothing to disambiguate, and matching what the key
+    /// *types* is most of what a menu key equivalent does. Most of — AppKit also
+    /// falls back to an ASCII-capable layout, which is how ⌘C keeps working on a
+    /// Cyrillic one, and this does not. What this does instead is take shift.
+    ///
+    /// Shift, because on AZERTY and on the Czech and Slovak layouts the number
+    /// row types punctuation and letters unshifted and shift is how you type a
+    /// digit at all. `charactersIgnoringModifiers` keeps shift — the same fact
+    /// that makes `switchTab` match back tab by key code instead — so on those
+    /// layouts the digit only ever arrives with shift held, and an exact ⌘ test
+    /// would put this feature entirely out of reach there. Where the digits are
+    /// unshifted nothing is claimed that wasn't asked for, because ⇧⌘1 types "!"
+    /// on such a layout and never reaches the `Int`.
+    ///
+    /// It buys back six of the nine, not all of them. On those same layouts
+    /// "⌘3", "⌘4" and "⌘5" are physically ⇧⌘ on the 3, 4 and 5 keys, which are
+    /// where macOS keeps its screenshot shortcuts — and those are registered on
+    /// key codes and taken above the app, so nothing here can reach them. Same
+    /// class of thing as the note on ⌃1…⌃9 in `rebuildWorldsMenu`, and with the
+    /// same remedy: System Settings ▸ Keyboard ▸ Keyboard Shortcuts, under
+    /// Screenshots this time.
+    ///
+    /// No menu items to go with these: nine of them, captioned with the same tab
+    /// titles the tab bar is already showing, is most of the Window menu for no
+    /// new information. The price is that they are discoverable only from the
+    /// README, and can't be remapped in System Settings ▸ Keyboard ▸ App
+    /// Shortcuts, which works off menu titles.
+    private func selectNumberedTab(for event: NSEvent) -> Bool {
+        // ⌘, or ⌘⇧ — see above. Not ⌥⌘ or ⌃⌘, which are unspoken for, and
+        // swallowing them here would be claiming keys this hasn't earned.
+        //
+        // `shortcutModifiers` has already dropped caps lock, the function bit
+        // and the numeric-keypad bit, none of which anyone chose to press. The
+        // last of those is why the keypad's digits work here too.
+        let modifiers = NSEvent.ModifierFlags(rawValue: event.shortcutModifiers)
+        guard modifiers.subtracting(.shift) == .command,
+              let characters = event.charactersIgnoringModifiers,
+              characters.count == 1,
+              // ASCII only, which is what `Int(String)` accepts — and so ⌘0
+              // falls through unclaimed, having no tab to be.
+              let number = Int(characters), number >= 1 else { return false }
+
+        // Scoped exactly as `switchTab` is, and for the same reasons.
+        guard let window = NSApp.keyWindow,
+              let worldWindow = window.delegate as? WorldWindow,
+              NSApp.modalWindow == nil, window.attachedSheet == nil else { return false }
+
+        // Swallowed from here on whether or not there's a tab there. ⌘4 with
+        // three tabs open has still been spoken for, and letting it through
+        // would only reach a responder chain with nothing bound to it, and beep.
+        //
+        // Repeats are dropped for the same reason macros and ⌃⇥ drop them:
+        // holding ⌘1 down would re-run the switch at the keyboard's repeat rate.
+        // Harmless here, since going to the tab you're on is now a no-op, but
+        // there is nothing for the second press to do either.
+        guard !event.isARepeat else { return true }
+
+        worldWindow.selectTab(numbered: number)
+        return true
+    }
+
     // MARK: Actions
 
     @objc private func connect() { WindowManager.shared.activeSession?.promptConnect() }
@@ -417,8 +519,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         settingsWindow?.show()
     }
 
-    /// ⌘1…⌘9. Focuses the world's tab if it's already open anywhere, otherwise
-    /// opens it in a new tab — a world is never in two tabs at once.
+    /// ⌃1…⌃9. Focuses the world's tab if it's already open anywhere, otherwise
+    /// opens it in a new tab — a world is never in two tabs at once. Opening it
+    /// does not connect it; the new tab says ⌘R for that, same as any other.
+    ///
+    /// That second half is why these are not on ⌘. "Go to it, opening it if you
+    /// have to" is a reasonable thing to want, but it is not what a number with
+    /// a command key in front of it means to anyone, and it meant ⌘1 opened a
+    /// tab you hadn't asked for. ⌘1…⌘9 select tabs now — see
+    /// `selectNumberedTab(for:)`.
     @objc private func switchWorld(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let world = WorldStore.shared.worlds.first(where: { $0.id == id }) else { return }

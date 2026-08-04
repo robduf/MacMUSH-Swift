@@ -27,6 +27,17 @@ Each tab shows a green dot while it's connected. Tabs you aren't looking at
 keep running: they stay connected, keep logging, and keep firing their triggers
 and timers.
 
+**⌘1**…**⌘9** go straight to a tab by its position across the top of the
+window you're in, with ⌘9 always the last one however many there are, and
+**⌃⇥** / **⌃⇧⇥** step through them in order.
+
+The Worlds menu numbers your *saved* worlds separately, on **⌃1**…**⌃9** — a
+different list, in the order you created the worlds rather than the order the
+tabs are in, and only the first nine get keys. ⌃1 goes to that world's tab
+wherever it is, including in another window, which ⌘1…⌘9 can't do; if it has
+no tab open yet, it gets one. (If ⌃1…⌃4 do nothing, macOS has them: System
+Settings ▸ Keyboard ▸ Keyboard Shortcuts ▸ Mission Control.)
+
 ## What you need
 
 The Swift compiler and the macOS SDK. Either:

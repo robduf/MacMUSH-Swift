@@ -226,6 +226,38 @@ final class WorldWindow: NSObject, NSWindowDelegate {
         selectAdjacentTab(by: -1)
     }
 
+    /// ⌘1…⌘9 — the tab at that position across the top, counting from the left.
+    ///
+    /// `number` is what you pressed, not an index: 1 is the leftmost tab. 9 is
+    /// the *last* tab, however many there are, which is the one departure from
+    /// counting and is deliberate — Safari, Chrome and Firefox all do it, so ⌘9
+    /// lands somewhere useful with three tabs open as readily as with twelve.
+    /// Anything past the end does nothing: `selectTab(at:)` checks the range,
+    /// and `indices.contains` is false for the -1 that ⌘9 on a window with no
+    /// tabs would hand it.
+    ///
+    /// Here rather than in the key handler for the same reason the wrap is:
+    /// turning a number into a position needs to know how many tabs there are,
+    /// and this is the object that knows.
+    func selectTab(numbered number: Int) {
+        guard number >= 1 else { return }
+        let index = number == 9 ? sessions.count - 1 : number - 1
+        // Already there — do nothing at all, rather than re-select. Pressing ⌘1
+        // to check you're on the first tab is a reflex, and without this it runs
+        // the whole of `showActiveSession`: every subview torn out and put back,
+        // and `focusInput` moving first responder to the command box. That last
+        // one is the reason this is worth a line of code. Select something in the
+        // scrollback to copy, press ⌘1 on the way to ⌘C, and the ⌘C would go to
+        // the command box instead and copy nothing.
+        //
+        // Here rather than in `selectTab(at:)`, where it would look like it
+        // belongs. The first tab a window ever gets is installed by `addTab`
+        // calling that with `activeIndex` already 0, so a guard down there would
+        // leave every new window blank.
+        guard index != activeIndex else { return }
+        selectTab(at: index)
+    }
+
     /// The arithmetic lives here, beside the array it indexes, rather than in
     /// the menu action. `sessions` and `activeIndex` are this window's own
     /// business; handing them out so a caller could add one to an index would
