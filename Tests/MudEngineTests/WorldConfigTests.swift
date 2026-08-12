@@ -92,13 +92,15 @@ final class WorldConfigTests {
         XCTAssertEqual(config.port, 4000)
         XCTAssertTrue(config.triggers.isEmpty)
         XCTAssertFalse(config.id.isEmpty)
-        // Pinned because `echoInput` is the one field that defaults on. Without
-        // this, tidying it to `false` to match its neighbours would pass every
-        // other test in the file and quietly stop new worlds echoing.
+        // Three fields default *on*, against a file full of neighbours that
+        // don't, and all three are pinned here for the same reason: flipping one
+        // to `false` to match the others would pass every remaining test and
+        // quietly change what a new world does. Each line below is the only
+        // thing standing between a tidy-looking edit and a silent regression.
         XCTAssertTrue(config.echoInput)
         XCTAssertFalse(config.chimeEnabled)
-        // The second field that defaults on, and pinned for the same reason.
         XCTAssertTrue(config.linkifyURLs)
+        XCTAssertTrue(config.tidyOutgoing)
         XCTAssertTrue(config.macros.isEmpty)
     }
 

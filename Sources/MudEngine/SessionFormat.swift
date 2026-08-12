@@ -81,27 +81,73 @@ public enum SessionFormat {
         // separated, and treating "connect\tRob\thunter2" as a single token
         // would hand the whole thing back unmasked.
         var tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-        guard let command = tokens.first?.lowercased() else { return line }
-
-        let keep: Int
-        if loginCommands.contains(command) {
-            keep = 2                // the command and the character name
-        } else if passwordCommands.contains(command) {
-            keep = 1                // everything after the command is a secret
-        } else {
-            return line
-        }
+        guard let keep = tokensToKeep(tokens.first) else { return line }
 
         guard tokens.count > keep else { return line }      // no password on this line
         for i in keep..<tokens.count { tokens[i] = "********" }
         return tokens.joined(separator: " ")
     }
 
+    /// Whether this text begins with a command that carries a secret.
+    ///
+    /// Exists so that things which *rewrite* what you typed can leave
+    /// credentials alone. Tidying text for a MUSH is the case in point: it turns
+    /// tabs into `%t`, which would fuse `connect\tRob\thunter2` into one token
+    /// and walk it straight past `redactLogin` — the password then goes to the
+    /// scrollback in full, and to the server in a form that cannot work. Folding
+    /// an accented character out of a password is the same class of harm, quieter.
+    ///
+    /// Checks the first token of **every** line, and the loop is load-bearing —
+    /// do not narrow it to the first line to match some future tidier comment.
+    ///
+    /// The reason is not obvious from here. Tidying collapses a whole block into
+    /// one line, and `redactLogin` only ever inspects the first token of what it
+    /// is handed. So if a login on line two of a paste didn't make the *block*
+    /// sensitive, the block would be tidied to `look%rconnect Rob hunter2`,
+    /// whose first token is `look%rconnect` — not a login command, mask never
+    /// lands, password painted across the scrollback. Checking every line is
+    /// what stops that, and `testContainsLoginSeesPastTheFirstLine` pins it.
+    public static func containsLogin(_ text: String) -> Bool {
+        for line in unifyingLineEndings(text).components(separatedBy: "\n") {
+            let first = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).first
+            if tokensToKeep(first.map(String.init)) != nil { return true }
+        }
+        return false
+    }
+
+    /// How many leading tokens of a login line are *not* secret, or nil if this
+    /// isn't a login line at all. The single place that knows the answer, so
+    /// `redactLogin` and `containsLogin` can never disagree about what counts.
+    private static func tokensToKeep(_ firstToken: String?) -> Int? {
+        guard let command = firstToken?.lowercased() else { return nil }
+        if loginCommands.contains(command) { return 2 }     // command + character name
+        if passwordCommands.contains(command) { return 1 }  // the rest is a secret
+        return nil
+    }
+
     /// `redactLogin` applied to each line of a multi-line block — an alias body
     /// or a world's auto-connect text, which are shown back to the user and so
     /// reach the same scrollback and the same log file.
     public static func redactBlock(_ text: String) -> String {
-        text.components(separatedBy: "\n").map(redactLogin).joined(separator: "\n")
+        unifyingLineEndings(text).components(separatedBy: "\n")
+            .map(redactLogin).joined(separator: "\n")
+    }
+
+    /// Every line separator becomes `\n`, so the line-splitting below can be a
+    /// plain `components(separatedBy:)`.
+    ///
+    /// Text pasted from a spreadsheet or an older source can use a bare `\r`,
+    /// and without this `"look\rconnect Rob hunter2"` is one line whose first
+    /// token is `look\rconnect` — not a login command, so the password sails
+    /// past the mask.
+    ///
+    /// It cannot be done as `split(whereSeparator: { $0 == "\r" || $0 == "\n" })`.
+    /// In Swift `"\r\n"` is a single `Character`, and it equals neither of those
+    /// — a CRLF paste would match nothing and stay one line.
+    static func unifyingLineEndings(_ text: String) -> String {
+        // The pair first, or it becomes two breaks instead of one.
+        text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     /// `connect <name> <password>` and its usual abbreviations, including

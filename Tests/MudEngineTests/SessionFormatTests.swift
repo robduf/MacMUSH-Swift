@@ -145,6 +145,58 @@ final class SessionFormatTests {
         XCTAssertEqual(SessionFormat.redactLogin("connect Rob"), "connect Rob")
     }
 
+    // MARK: Keeping rewriters away from credentials
+
+    /// `containsLogin` guards the text-tidying path, and must fire for at least
+    /// everything `redactLogin` would mask. Answer false for one of these and
+    /// tidying turns the tabs in a pasted `connect` line into `%t`, the mask
+    /// stops matching, and the password is painted across the scrollback.
+    ///
+    /// Deliberately broader than the mask: `connect Rob` carries no password
+    /// yet, but the server is about to ask for one, and the answer to that
+    /// prompt must not be rewritten either.
+    func testContainsLoginIsAtLeastAsBroadAsRedaction() {
+        for line in ["connect Rob hunter2", "Connect Rob hunter2", "cd Rob hunter2",
+                     "co Rob hunter2", "ch Rob hunter2", "create Rob hunter2",
+                     "@password old new", "@pcreate Rob=hunter2",
+                     "connect\tRob\thunter2", "connect Rob"] {
+            XCTAssertTrue(SessionFormat.containsLogin(line))
+        }
+    }
+
+    func testContainsLoginIgnoresOrdinaryLines() {
+        for line in ["look", "say hello there", "connecting to the hub", "",
+                     "page Caitlin=connect the dots"] {
+            XCTAssertFalse(SessionFormat.containsLogin(line))
+        }
+    }
+
+    /// A login pasted as part of a block still counts. The safe direction is to
+    /// leave the whole block untidied when any line of it might be a credential.
+    func testContainsLoginSeesPastTheFirstLine() {
+        XCTAssertTrue(SessionFormat.containsLogin("look\nconnect Rob hunter2"))
+        XCTAssertFalse(SessionFormat.containsLogin("look\nsay hi"))
+    }
+
+    /// A bare `\r` between lines — spreadsheets and older sources still produce
+    /// them, and the command box accepts them — must not hide a login behind it.
+    /// Splitting on `"\n"` alone leaves `look\rconnect Rob hunter2` as one line
+    /// whose first token is `look\rconnect`, which matches nothing.
+    func testCarriageReturnsDoNotHideALogin() {
+        XCTAssertTrue(SessionFormat.containsLogin("look\rconnect Rob hunter2"))
+        XCTAssertTrue(SessionFormat.containsLogin("look\r\nconnect Rob hunter2"))
+        XCTAssertFalse(SessionFormat.redactBlock("look\rconnect Rob hunter2")
+                        .contains("hunter2"))
+    }
+
+    /// The mask itself must survive the refactor that extracted the shared
+    /// token-counting helper — same answers as before, one source of truth.
+    func testRedactStillMasksAfterSharingTheHelper() {
+        XCTAssertEqual(SessionFormat.redactLogin("ch Rob hunter2"), "ch Rob ********")
+        XCTAssertEqual(SessionFormat.redactLogin("newpassword old new"),
+                       "newpassword ******** ********")
+    }
+
     // MARK: Log naming
 
     func testLogFileNameIsSortableAndStable() {
@@ -214,6 +266,11 @@ extension SessionFormatTests {
         ("testRedactLoginHandlesTabs", { SessionFormatTests().testRedactLoginHandlesTabs() }),
         ("testRedactBlockCoversEveryLine", { SessionFormatTests().testRedactBlockCoversEveryLine() }),
         ("testRedactLoginLeavesOrdinaryLinesAlone", { SessionFormatTests().testRedactLoginLeavesOrdinaryLinesAlone() }),
+        ("testContainsLoginIsAtLeastAsBroadAsRedaction", { SessionFormatTests().testContainsLoginIsAtLeastAsBroadAsRedaction() }),
+        ("testContainsLoginIgnoresOrdinaryLines", { SessionFormatTests().testContainsLoginIgnoresOrdinaryLines() }),
+        ("testContainsLoginSeesPastTheFirstLine", { SessionFormatTests().testContainsLoginSeesPastTheFirstLine() }),
+        ("testCarriageReturnsDoNotHideALogin", { SessionFormatTests().testCarriageReturnsDoNotHideALogin() }),
+        ("testRedactStillMasksAfterSharingTheHelper", { SessionFormatTests().testRedactStillMasksAfterSharingTheHelper() }),
         ("testLogFileNameIsSortableAndStable", { SessionFormatTests().testLogFileNameIsSortableAndStable() }),
         ("testLogFileNameIgnoresSystemLocale", { SessionFormatTests().testLogFileNameIgnoresSystemLocale() }),
         ("testHeaderAndFooterCarryTheDetailsYouWantMonthsLater", { SessionFormatTests().testHeaderAndFooterCarryTheDetailsYouWantMonthsLater() }),

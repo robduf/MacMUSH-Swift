@@ -219,6 +219,11 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
     private let logToggle = StatusToggle(label: "LOG", onColor: .systemGreen)
     private let chimeToggle = StatusToggle(label: "BELL", onColor: .systemYellow,
                                            symbols: (on: "bell.fill", off: "bell.slash"))
+    /// Drawn as a word rather than a symbol. There is no glyph that says "your
+    /// curly quotes are being straightened", and a wand or a broom would need a
+    /// tooltip to mean anything — which is exactly what a status readout is
+    /// supposed to save you.
+    private let tidyToggle = StatusToggle(label: "TIDY", onColor: .systemTeal)
     private let elapsedLabel = NSTextField(labelWithString: "")
 
     private let renderer = AnsiRenderer()
@@ -438,6 +443,8 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         logToggle.action = #selector(toggleLogging)
         chimeToggle.target = self
         chimeToggle.action = #selector(toggleChime)
+        tidyToggle.target = self
+        tidyToggle.action = #selector(toggleTidy)
 
         // Monospaced digits, or the timer jitters a pixel every second as the
         // glyph widths change under it.
@@ -511,7 +518,8 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
 
         // `sub`, not `view` — `view` is this session's root and shadowing it
         // here would quietly add every control to itself.
-        for sub in [splitView, statusLabel, logToggle, chimeToggle, elapsedLabel] as [NSView] {
+        for sub in [splitView, statusLabel, logToggle, chimeToggle,
+                    tidyToggle, elapsedLabel] as [NSView] {
             sub.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(sub)
         }
@@ -519,7 +527,7 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // A long host name shouldn't shove the timer off the right edge — let
         // the status text truncate and keep the readouts pinned.
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        for readout in [logToggle, chimeToggle, elapsedLabel] as [NSView] {
+        for readout in [logToggle, chimeToggle, tidyToggle, elapsedLabel] as [NSView] {
             readout.setContentCompressionResistancePriority(.required, for: .horizontal)
             readout.setContentHuggingPriority(.required, for: .horizontal)
         }
@@ -551,8 +559,11 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             chimeToggle.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
             chimeToggle.leadingAnchor.constraint(equalTo: logToggle.trailingAnchor, constant: 10),
 
+            tidyToggle.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            tidyToggle.leadingAnchor.constraint(equalTo: chimeToggle.trailingAnchor, constant: 10),
+
             elapsedLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            elapsedLabel.leadingAnchor.constraint(equalTo: chimeToggle.trailingAnchor, constant: 10),
+            elapsedLabel.leadingAnchor.constraint(equalTo: tidyToggle.trailingAnchor, constant: 10),
             elapsedLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
             elapsedLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
         ])
@@ -1125,6 +1136,18 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
             ? "Chiming when \(config.name) talks and you're looking elsewhere.\nClick to silence."
             : "Silent. Click to chime when \(config.name) talks in the background."
 
+        tidyToggle.level = config.tidyOutgoing ? .on : .off
+        tidyToggle.toolTip = config.tidyOutgoing
+            ? """
+              Tidying what you send: line breaks become %r, tabs %t, and curly \
+              quotes and dashes straighten out.
+              Click for raw typing — needed to send several commands at once.
+              """
+            : """
+              Raw: what you type goes out untouched, one command per line.
+              Click to tidy it for the MUSH instead.
+              """
+
         updateElapsed()
     }
 
@@ -1162,6 +1185,18 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         // The bell filling in or crossing out is the confirmation; no line goes
         // into the scrollback for this one. Ticking a preference isn't something
         // the world said, and it would be in the log forever.
+        updateStatus()
+    }
+
+    /// Switch between tidied and raw typing, and remember which for this world.
+    ///
+    /// Per world rather than per app, like every other switch here: a MUSH wants
+    /// `%r` and a Diku-style MUD would just be shown the two characters. Same
+    /// silence as the chime — the word going dim is the confirmation, and a note
+    /// in the scrollback would end up in the log.
+    @objc private func toggleTidy() {
+        config.tidyOutgoing.toggle()
+        saveConfig()
         updateStatus()
     }
 
@@ -1245,10 +1280,64 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         historyIndex = -1
         draft = ""
 
+        // Tidied here and nowhere else. This is the one path carrying text a
+        // *person* typed or pasted; triggers, aliases, timers, macros and the
+        // connect script all reach `send` by other routes, and every one of them
+        // is a list of commands where a line break means "next command" and has
+        // to keep meaning that.
+        //
+        // Note what it does to the loop at the bottom: tidying leaves no
+        // newlines, so the block arrives as a single `submit`. That is the whole
+        // point — `page Caitlin=` then covers the entire pose rather than its
+        // first line, with lines two and three landing on the game as bare
+        // commands. Tidying off, and the loop behaves exactly as it always did.
+        //
+        // `history` above keeps `raw`: ↑ should bring back what you wrote, in
+        // the shape you wrote it, not a line full of %r.
+        let sensitive = mustNotRewrite(raw)
+        let prepared = (config.tidyOutgoing && !sensitive) ? OutgoingText.tidy(raw) : raw
+
+        // A misfire must not be silent. TIDY stays lit through this, so with no
+        // word here it looks exactly like the bug tidying was built to fix: a
+        // pose arriving in three pieces with its quotes still curly, and nothing
+        // saying why. Only worth saying when tidying would have changed
+        // something — an ordinary `connect Rob hunter2` already *is* the one
+        // clean line it would have produced.
+        if config.tidyOutgoing && sensitive && OutgoingText.tidy(raw) != raw {
+            appendSystem("Sent as typed — that looked like it might carry a password.")
+        }
+
         // Slash commands still work while disconnected, so the block can't be
         // rejected up front — `send` warns once for the whole batch instead.
         warnedNotConnected = false
-        for line in raw.components(separatedBy: "\n") { submit(line) }
+        for line in prepared.components(separatedBy: "\n") { submit(line) }
+    }
+
+    /// Whether this text has to reach the world exactly as typed, tidying or no.
+    ///
+    /// Both cases are credentials, and both are ways for a rewrite to do real
+    /// damage rather than cosmetic damage.
+    ///
+    /// `echoOn` is false exactly while the server has negotiated telnet ECHO off
+    /// to collect a password. Fold an accented character out of one of those, or
+    /// drop one the fold has no answer for, and the login fails — with nothing
+    /// echoed anywhere that could show you why, because suppressing the echo is
+    /// the entire point of the mode.
+    ///
+    /// `containsLogin` catches the commoner shape, where the password rides
+    /// inline on `connect Rob hunter2`. Tidying turns a tab-separated paste of
+    /// that into `connect%tRob%thunter2` — one token as far as `redactLogin` is
+    /// concerned, so the mask never lands and `appendEcho` paints the password
+    /// across the scrollback. The line then fails to log in, so it gets retried,
+    /// and painted again.
+    ///
+    /// Deliberately broad, and it does misfire: any line whose first word is
+    /// `connect`, `create`, `password` or a sibling makes the whole block
+    /// sensitive, which a pose opening "Create a character sheet first." manages
+    /// by accident. That costs you a tidy. The alternative is guessing which
+    /// `connect` is prose, and the price of guessing wrong is a leaked password.
+    private func mustNotRewrite(_ text: String) -> Bool {
+        !echoOn || SessionFormat.containsLogin(text)
     }
 
     /// Replace everything in the command box without corrupting undo.

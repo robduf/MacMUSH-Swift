@@ -22,6 +22,7 @@ public struct WorldConfig: Codable, Equatable, Sendable {
     public var echoInput: Bool             // show what you type in the scrollback
     public var linkifyURLs: Bool           // turn web addresses in the text into links
     public var macros: [Macro]             // quick-reference buttons for this world
+    public var tidyOutgoing: Bool          // rewrite typed text for a MUSH before sending
 
     public init(id: String = UUID().uuidString,
                 name: String = "My World",
@@ -36,7 +37,8 @@ public struct WorldConfig: Codable, Equatable, Sendable {
                 chimeEnabled: Bool = false,
                 echoInput: Bool = true,
                 linkifyURLs: Bool = true,
-                macros: [Macro] = []) {
+                macros: [Macro] = [],
+                tidyOutgoing: Bool = true) {
         self.id = id
         self.name = name
         self.host = host
@@ -51,12 +53,13 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         self.echoInput = echoInput
         self.linkifyURLs = linkifyURLs
         self.macros = macros
+        self.tidyOutgoing = tidyOutgoing
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, host, port, connectText, triggers, aliases, timers
         case logEnabled, logDirectory, chimeEnabled, echoInput
-        case linkifyURLs, macros
+        case linkifyURLs, macros, tidyOutgoing
     }
 
     public init(from decoder: Decoder) throws {
@@ -84,6 +87,19 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         // has to be asked for.
         self.linkifyURLs = try c.decodeIfPresent(Bool.self, forKey: .linkifyURLs) ?? true
         self.macros = try c.decodeIfPresent([Macro].self, forKey: .macros) ?? []
+        // Absent means *on*, which breaks the rule the two switches above
+        // follow. They default to their old behaviour so that upgrading changes
+        // nothing you didn't ask for; this one defaults to the new behaviour,
+        // because the old behaviour is the bug. A world file written before this
+        // existed belongs to a client that sent pasted curly quotes straight at
+        // a server that mangles them, and sent a multi-line pose as three
+        // separate commands. Nobody wants to keep that and then go find a switch
+        // per world to stop it.
+        //
+        // What makes it safe to depart from the rule is that this switch is *on
+        // screen*: the status line says TIDY, lit, from the first launch. A
+        // default that changes behaviour silently would be a different matter.
+        self.tidyOutgoing = try c.decodeIfPresent(Bool.self, forKey: .tidyOutgoing) ?? true
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -102,5 +118,6 @@ public struct WorldConfig: Codable, Equatable, Sendable {
         try c.encode(echoInput, forKey: .echoInput)
         try c.encode(linkifyURLs, forKey: .linkifyURLs)
         try c.encode(macros, forKey: .macros)
+        try c.encode(tidyOutgoing, forKey: .tidyOutgoing)
     }
 }

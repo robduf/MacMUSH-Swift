@@ -38,6 +38,31 @@ wherever it is, including in another window, which ⌘1…⌘9 can't do; if it h
 no tab open yet, it gets one. (If ⌃1…⌃4 do nothing, macOS has them: System
 Settings ▸ Keyboard ▸ Keyboard Shortcuts ▸ Mission Control.)
 
+## Typing and pasting
+
+MUSH servers take one line per command and don't speak UTF-8. Paste a pose
+written anywhere else and both facts bite at once: the line breaks arrive as
+separate commands, so `page Caitlin=` covers only the first line and the rest
+land on the game as bare input, and the curly quotes and em dashes your word
+processor inserted come back as replacement glyphs.
+
+**TIDY** in the status line fixes that on the way out. Line breaks become `%r`
+and tabs `%t`, so the whole block goes as one command; curly quotes straighten,
+an em dash becomes `--`, an ellipsis becomes three stops; accented letters fold
+to plain ones and anything with no ASCII form at all is dropped. Click it to
+send raw instead — the setting is remembered per world.
+
+`%` is left alone, so a `%r` you typed yourself still works. The cost is that
+tidying joins *everything* into one line: to fire several commands at once, turn
+it off first.
+
+Two things are never rewritten, whatever the toggle says. While the server has
+telnet ECHO off to collect a password, and on any line beginning `connect`,
+`create`, `@password` or a sibling. Rewriting a credential is how a password
+ends up mangled, failing to log in, and painted across your scrollback unmasked.
+That check is broad enough to misfire on a pose opening "Create a character
+sheet first." — when it does, the line goes out as typed and MacMUSH says so.
+
 ## Colouring what people say
 
 A trigger can repaint the line it matched. Settings ▸ Triggers has a **Color**
@@ -133,6 +158,7 @@ Sources/
     AppConfig.swift       the saved world list + which one is active
     Matcher.swift         trigger/alias matching (wildcards or regex)
     Macro.swift           macro buttons, key shortcuts, the shared colour set
+    OutgoingText.swift    tidying what you type into something a MUSH takes
     SessionFormat.swift   elapsed time, log filenames, log header/footer
   MacMUSH/            the AppKit app (code-only, no storyboards)
     main.swift            NSApplication entry

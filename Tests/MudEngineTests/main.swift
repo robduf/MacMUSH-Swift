@@ -11,6 +11,7 @@ let suites: [TestSuite] = [
     AppConfigTests.suite,
     MacroTests.suite,
     MatcherTests.suite,
+    OutgoingTextTests.suite,
     SessionFormatTests.suite,
     TelnetParserTests.suite,
     WorldConfigTests.suite,
