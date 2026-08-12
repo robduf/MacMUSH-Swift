@@ -46,7 +46,20 @@ final class AnsiRenderer {
     private static let linkDetector = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue)
 
-    func append(_ ops: [AnsiOp], to textView: NSTextView) {
+    /// Render ops into the scrollback.
+    ///
+    /// `highlight`, when given, repaints every character in this batch — the
+    /// whole line, which is what a trigger colour is for. It goes on after the
+    /// ANSI attributes rather than instead of them, so a highlighted line keeps
+    /// its bold, italics and underlines and loses only its colours. That's the
+    /// useful half of the trade: the world's emphasis survives, and the thing
+    /// you asked to be able to spot at a glance is one flat colour.
+    ///
+    /// Backgrounds are cleared along with the foreground. A line that arrived
+    /// with an inverse or coloured background would otherwise keep it, and the
+    /// new foreground was chosen to be read against the scrollback's near-black
+    /// — not against whatever the world happened to paint behind the text.
+    func append(_ ops: [AnsiOp], to textView: NSTextView, highlight: NSColor? = nil) {
         guard let storage = textView.textStorage else { return }
         let result = NSMutableAttributedString()
         for op in ops {
@@ -59,6 +72,15 @@ final class AnsiRenderer {
                 result.append(attributed(styled))
             }
         }
+        if let highlight = highlight, result.length > 0 {
+            let whole = NSRange(location: 0, length: result.length)
+            result.addAttribute(.foregroundColor, value: highlight, range: whole)
+            result.removeAttribute(.backgroundColor, range: whole)
+        }
+        // Before `storage.append`, because the detector should only ever see the
+        // line that just arrived, never the whole scrollback. Order against the
+        // highlight above doesn't matter — that touches only the two colour
+        // attributes and this adds only `.link` and an underline.
         if linksEnabled { AnsiRenderer.linkify(result) }
         storage.append(result)
 

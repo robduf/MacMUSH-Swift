@@ -136,7 +136,7 @@ final class MacroTests {
     }
 
     /// The reason `color` is decoded as a string and then looked up, rather than
-    /// asked for as a `MacroColor`: asking for the enum makes an unrecognised
+    /// asked for as a `SwatchColor`: asking for the enum makes an unrecognised
     /// name *throw*, and a throw in a macro takes the whole world file with it —
     /// every trigger, alias and timer in it — over one unknown colour. A name
     /// from a newer build, or a typo in a hand-edited file, must cost the colour
@@ -167,7 +167,7 @@ final class MacroTests {
     /// Rename a case and every world file saved before the rename quietly loses
     /// its colours — the lenient decode above is exactly what would hide it.
     func testColorNamesAreStableOnDisk() {
-        XCTAssertEqual(MacroColor.allCases.map { $0.rawValue },
+        XCTAssertEqual(SwatchColor.allCases.map { $0.rawValue },
                        ["plain", "red", "orange", "yellow",
                         "green", "teal", "blue", "purple", "pink"])
     }
@@ -178,17 +178,17 @@ final class MacroTests {
     /// lookup falls back to item 0 when it finds nothing, so item 0 has to be
     /// the harmless one.
     func testPlainIsTheFirstColor() {
-        XCTAssertEqual(MacroColor.allCases.first, .plain)
+        XCTAssertEqual(SwatchColor.allCases.first, .plain)
         XCTAssertEqual(Macro().color, .plain)
     }
 
     /// Nine menu items, nine captions, none of them blank.
     func testEveryColorHasADisplayName() {
-        XCTAssertEqual(MacroColor.allCases.count, 9)
-        for color in MacroColor.allCases {
+        XCTAssertEqual(SwatchColor.allCases.count, 9)
+        for color in SwatchColor.allCases {
             XCTAssertFalse(color.displayName.isEmpty)
         }
-        XCTAssertEqual(MacroColor.plain.displayName, "None")
+        XCTAssertEqual(SwatchColor.plain.displayName, "None")
     }
 
     // MARK: Matching

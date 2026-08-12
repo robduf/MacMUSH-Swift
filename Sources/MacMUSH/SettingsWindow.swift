@@ -242,10 +242,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         switch kind {
         case .trigger:
             addColumn(table, "enabled", "On", width: 30, minWidth: 30)
-            addColumn(table, "pattern", "Pattern", width: 190)
+            addColumn(table, "pattern", "Pattern", width: 170)
             addColumn(table, "gag", "Gag", width: 36, minWidth: 36)
             addColumn(table, "regex", "Regex", width: 46, minWidth: 46)
-            addColumn(table, "send", "Send", width: 200)
+            // Triggers only, not aliases: this paints a line arriving from the
+            // world, and an alias matches something you typed — there is no
+            // incoming line for it to colour.
+            addColumn(table, "color", "Color", width: 84, minWidth: 74)
+            addColumn(table, "send", "Send", width: 136)
         case .alias:
             addColumn(table, "enabled", "On", width: 30, minWidth: 30)
             addColumn(table, "pattern", "Pattern", width: 190)
@@ -594,6 +598,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             case "send": return textCell(tableView, identifier: identifier, value: rule.sendText)
             case "gag": return checkCell(tableView, identifier: identifier, on: rule.gag)
             case "regex": return checkCell(tableView, identifier: identifier, on: rule.isRegex)
+            // Only the trigger table has this column, so `kind` is already
+            // .trigger by the time it's asked for. The identifier carries the
+            // kind anyway, because that is what `colorPicked` reads back to know
+            // which table — and so which array — a pick belongs to.
+            case "color": return colorCell(tableView, identifier: identifier, color: rule.highlight)
             default: return nil
             }
         case .timer:
@@ -687,7 +696,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
     /// list can't change, and rebuilding it on every scroll would redraw nine
     /// images for nothing.
     private func colorCell(_ table: NSTableView, identifier: String,
-                           color: MacroColor) -> NSPopUpButton {
+                           color: SwatchColor) -> NSPopUpButton {
         let id = NSUserInterfaceItemIdentifier(identifier)
         let popup: NSPopUpButton
         if let reused = table.makeView(withIdentifier: id, owner: self) as? NSPopUpButton {
@@ -705,7 +714,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
             // and `popup.menu?.addItem(…)` on a nil one does nothing at all,
             // quietly, leaving an empty popup and no clue why.
             let menu = NSMenu()
-            for swatch in MacroColor.allCases {
+            for swatch in SwatchColor.allCases {
                 let item = NSMenuItem(title: swatch.displayName,
                                       action: nil, keyEquivalent: "")
                 item.image = swatch.swatchImage
@@ -715,7 +724,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         }
         // Position in `allCases` is the index in the menu, because that array is
         // what built it. Declaration order, and stable.
-        popup.selectItem(at: MacroColor.allCases.firstIndex(of: color) ?? 0)
+        popup.selectItem(at: SwatchColor.allCases.firstIndex(of: color) ?? 0)
         return popup
     }
 
@@ -981,15 +990,21 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         commitWorld(at: i)
     }
 
-    // MARK: Macros
+    // MARK: Colours
 
-    /// A colour was chosen in the Color column.
+    /// A colour was chosen in a Color column — the macro table's, or the trigger
+    /// table's. Which one is read off the cell's identifier, the same way
+    /// `checkToggled` does it, because one action serves both tables.
     @objc private func colorPicked(_ sender: NSPopUpButton) {
+        guard let raw = sender.identifier?.rawValue else { return }
+        let parts = raw.split(separator: ".", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let kind = Kind(rawValue: parts[0]) else { return }
+
         // Both read before `endEditing`, for the same reason `shortcutRecorded`
         // does it: committing a pending edit can rebuild the table, and this view
         // is then no longer in it — `row(for:)` would answer -1 and the selection
         // would be read off a popup that has since been handed to another row.
-        let row = macrosTable.row(for: sender)
+        let row = ruleTable(for: kind).row(for: sender)
         let index = sender.indexOfSelectedItem
 
         // A popup doesn't take first responder, so a cell being typed into right
@@ -997,12 +1012,23 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource,
         // pre-edit text gets written back over what was typed.
         endEditing()
 
-        guard let i = editingIndex, row >= 0, row < worlds[i].macros.count else { return }
-        guard index >= 0, index < MacroColor.allCases.count else { return }
+        guard let i = editingIndex, row >= 0 else { return }
+        guard index >= 0, index < SwatchColor.allCases.count else { return }
+        let picked = SwatchColor.allCases[index]
 
-        let picked = MacroColor.allCases[index]
-        guard worlds[i].macros[row].color != picked else { return }
-        worlds[i].macros[row].color = picked
+        switch kind {
+        case .macro:
+            guard row < worlds[i].macros.count else { return }
+            guard worlds[i].macros[row].color != picked else { return }
+            worlds[i].macros[row].color = picked
+        case .trigger:
+            guard row < worlds[i].triggers.count else { return }
+            guard worlds[i].triggers[row].highlight != picked else { return }
+            worlds[i].triggers[row].highlight = picked
+        case .alias, .timer:
+            // Neither table has a Color column, so nothing can send this.
+            return
+        }
         commitWorld(at: i)
     }
 

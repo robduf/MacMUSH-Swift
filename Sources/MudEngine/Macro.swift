@@ -64,20 +64,27 @@ public struct KeyShortcut: Equatable, Codable, Sendable {
     }
 }
 
-/// The colour a macro's button is painted.
+/// The app's fixed set of colours, used wherever something in a world can be
+/// tinted: a macro button's fill, a trigger's highlight.
 ///
 /// A fixed set rather than a free-form colour, so the shades can be chosen once
-/// to stay readable against both a light and a dark palette, and so the label on
+/// to stay readable against both a light and a dark palette, and so a label on
 /// top can be black or white to suit without asking anyone to think about it.
 ///
+/// One set of *names*, two sets of shades. What reads well as a button fill is
+/// too dark to read as text on the scrollback's near-black, so the app side
+/// keeps a separate table for each; see `Swatch.swift`. Sharing the names is the
+/// point — "the red one" means the same thing in the macro list and the trigger
+/// list, and a world file records `"red"` either way.
+///
 /// The case is named `plain` rather than `none` on purpose. `none` is also
-/// `Optional`'s case, and `MacroColor(rawValue: x) ?? .none` is genuinely
+/// `Optional`'s case, and `SwatchColor(rawValue: x) ?? .none` is genuinely
 /// ambiguous — the compiler can read that `.none` as an empty optional and hand
 /// back the wrong type. `plain` has no such twin.
 ///
 /// The actual shades live on the app side; the engine has no AppKit and does not
 /// need one.
-public enum MacroColor: String, Codable, Sendable, CaseIterable {
+public enum SwatchColor: String, Codable, Sendable, CaseIterable {
     case plain, red, orange, yellow, green, teal, blue, purple, pink
 
     /// What the menu item says.
@@ -93,6 +100,19 @@ public enum MacroColor: String, Codable, Sendable, CaseIterable {
         case .purple: return "Purple"
         case .pink:   return "Pink"
         }
+    }
+
+    /// Build from a name that might be missing, might be nonsense, and must not
+    /// be allowed to fail.
+    ///
+    /// Every colour in a world file arrives through here. The alternative —
+    /// decoding straight into `SwatchColor` — makes an unrecognised name *throw*,
+    /// and a throw while decoding a rule loses the entire world it belongs to:
+    /// every trigger, alias, timer and macro, over one bad string. A name written
+    /// by a newer build, or a typo in a hand-edited file, should cost the colour
+    /// and nothing else.
+    public init(lenient name: String?) {
+        self = SwatchColor(rawValue: name ?? "") ?? .plain
     }
 }
 
@@ -111,14 +131,14 @@ public struct Macro: Equatable, Codable, Sendable {
     /// nil means the button is the only way to reach it.
     public var shortcut: KeyShortcut?
     /// What colour to paint the button. `.plain` leaves it the standard grey.
-    public var color: MacroColor
+    public var color: SwatchColor
 
     public init(id: String = UUID().uuidString,
                 label: String = "",
                 sendText: String = "",
                 sendImmediately: Bool = true,
                 shortcut: KeyShortcut? = nil,
-                color: MacroColor = .plain) {
+                color: SwatchColor = .plain) {
         self.id = id
         self.label = label
         self.sendText = sendText
@@ -149,7 +169,7 @@ public struct Macro: Equatable, Codable, Sendable {
         self.sendText = try c.decodeIfPresent(String.self, forKey: .sendText) ?? ""
         self.sendImmediately = try c.decodeIfPresent(Bool.self, forKey: .sendImmediately) ?? true
         self.shortcut = try c.decodeIfPresent(KeyShortcut.self, forKey: .shortcut)
-        // Decoded as a string and then looked up, rather than as `MacroColor`
+        // Decoded as a string and then looked up, rather than as `SwatchColor`
         // directly. Asking for the enum makes an unrecognised name *throw*, and a
         // throw here loses the whole world — every trigger, alias and timer in it
         // — over one unknown colour. This way a name from a newer build, or a
@@ -160,7 +180,6 @@ public struct Macro: Equatable, Codable, Sendable {
         // value of the wrong type, and a number where the name should be is
         // exactly the sort of thing hand-editing produces. This way missing,
         // null, and wrong-typed all arrive as nil and all mean uncoloured.
-        let name: String? = try? c.decode(String.self, forKey: .color)
-        self.color = MacroColor(rawValue: name ?? "") ?? .plain
+        self.color = SwatchColor(lenient: try? c.decode(String.self, forKey: .color))
     }
 }

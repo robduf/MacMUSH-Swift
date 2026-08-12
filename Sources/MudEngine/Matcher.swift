@@ -21,6 +21,9 @@ public struct MatchRule: Equatable, Codable, Sendable {
     public var script: String
     public var gag: Bool             // triggers only: hide the matching line
     public var keepEvaluating: Bool  // keep testing later rules after a match
+    /// Triggers only: repaint the matching line in this colour. `.plain` leaves
+    /// the world's own ANSI colours alone, which is what almost every rule wants.
+    public var highlight: SwatchColor
 
     public init(id: String = UUID().uuidString,
                 name: String = "",
@@ -31,7 +34,8 @@ public struct MatchRule: Equatable, Codable, Sendable {
                 sendText: String = "",
                 script: String = "",
                 gag: Bool = false,
-                keepEvaluating: Bool = false) {
+                keepEvaluating: Bool = false,
+                highlight: SwatchColor = .plain) {
         self.id = id
         self.name = name
         self.pattern = pattern
@@ -42,6 +46,52 @@ public struct MatchRule: Equatable, Codable, Sendable {
         self.script = script
         self.gag = gag
         self.keepEvaluating = keepEvaluating
+        self.highlight = highlight
+    }
+
+    // Codable is written out rather than synthesised, and decodes leniently, for
+    // the reason `WorldConfig` gives at the top of its own file: a field added
+    // here later must not make every world file written before it unreadable.
+    //
+    // That is not a hypothetical. `highlight` is exactly such a field, and the
+    // synthesised decoder requires *every* key — a default value on the property
+    // is not consulted. Adding it without this would have made each existing rule
+    // throw on load, and a throw inside `worlds.json` costs the whole file: the
+    // fallback path hands back one empty default world, and every trigger, alias,
+    // timer and macro is silently gone.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, pattern, isRegex, ignoreCase, enabled
+        case sendText, script, gag, keepEvaluating, highlight
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        self.name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        self.pattern = try c.decodeIfPresent(String.self, forKey: .pattern) ?? ""
+        self.isRegex = try c.decodeIfPresent(Bool.self, forKey: .isRegex) ?? false
+        self.ignoreCase = try c.decodeIfPresent(Bool.self, forKey: .ignoreCase) ?? true
+        self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.sendText = try c.decodeIfPresent(String.self, forKey: .sendText) ?? ""
+        self.script = try c.decodeIfPresent(String.self, forKey: .script) ?? ""
+        self.gag = try c.decodeIfPresent(Bool.self, forKey: .gag) ?? false
+        self.keepEvaluating = try c.decodeIfPresent(Bool.self, forKey: .keepEvaluating) ?? false
+        self.highlight = SwatchColor(lenient: try? c.decode(String.self, forKey: .highlight))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(pattern, forKey: .pattern)
+        try c.encode(isRegex, forKey: .isRegex)
+        try c.encode(ignoreCase, forKey: .ignoreCase)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(sendText, forKey: .sendText)
+        try c.encode(script, forKey: .script)
+        try c.encode(gag, forKey: .gag)
+        try c.encode(keepEvaluating, forKey: .keepEvaluating)
+        try c.encode(highlight, forKey: .highlight)
     }
 }
 
@@ -84,6 +134,15 @@ public struct RuleMatch: Equatable, Sendable {
 public struct MatchResult: Equatable, Sendable {
     public let matches: [RuleMatch]
     public let gag: Bool
+    /// What to repaint the line, from the first rule that matched and asked for a
+    /// colour. `.plain` means leave it as the world sent it.
+    ///
+    /// First rather than last, so the colour follows the same rule everything
+    /// else here does: order in the list is priority, and a specific rule put
+    /// above a catch-all wins. Last-wins would invert that, and would mean a
+    /// broad `*` rule added at the bottom quietly repainted lines that a rule
+    /// above it had already claimed.
+    public let highlight: SwatchColor
 }
 
 public enum Matcher {
@@ -96,6 +155,7 @@ public enum Matcher {
     public static func evaluate(_ rules: [MatchRule], line: String) -> MatchResult {
         var matches: [RuleMatch] = []
         var gag = false
+        var highlight = SwatchColor.plain
 
         for rule in rules {
             guard rule.enabled, !rule.pattern.isEmpty else { continue }
@@ -119,10 +179,12 @@ public enum Matcher {
                 sendText: expandWildcards(rule.sendText, groups: groups)
             ))
             if rule.gag { gag = true }
+            // Only the first colour offered is kept; see `MatchResult.highlight`.
+            if highlight == .plain { highlight = rule.highlight }
             if !rule.keepEvaluating { break }
         }
 
-        return MatchResult(matches: matches, gag: gag)
+        return MatchResult(matches: matches, gag: gag, highlight: highlight)
     }
 
     /// Expand %0…%9 (and %% -> %) in a template using the captured groups.

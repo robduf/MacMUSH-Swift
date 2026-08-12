@@ -95,6 +95,132 @@ final class MatcherTests {
         XCTAssertTrue(tm.enabled)
         XCTAssertFalse(tm.oneShot)
     }
+
+    // MARK: Highlight
+
+    func testNoHighlightByDefault() {
+        let t = MatchRule(pattern: "* pages: *")
+        XCTAssertEqual(t.highlight, .plain)
+        XCTAssertEqual(Matcher.evaluate([t], line: "Caitlin pages: hello").highlight, .plain)
+    }
+
+    func testLineThatMatchesNothingIsNotHighlighted() {
+        let t = MatchRule(pattern: "You paged *", highlight: .teal)
+        XCTAssertEqual(Matcher.evaluate([t], line: "Caitlin pages: hello").highlight, .plain)
+    }
+
+    func testHighlightComesFromTheMatchingRule() {
+        let t = MatchRule(pattern: "You paged *", highlight: .teal)
+        XCTAssertEqual(Matcher.evaluate([t], line: "You paged Caitlin with 'hi'").highlight, .teal)
+    }
+
+    /// Order in the list is priority, so a specific rule placed above a catch-all
+    /// keeps its colour. Last-wins would mean a broad `*` rule added at the
+    /// bottom of the list silently repainted lines an earlier rule had claimed.
+    func testFirstColouredRuleWinsNotLast() {
+        let specific = MatchRule(pattern: "You paged *", keepEvaluating: true, highlight: .teal)
+        let catchAll = MatchRule(pattern: "*", keepEvaluating: true, highlight: .red)
+        let r = Matcher.evaluate([specific, catchAll], line: "You paged Caitlin with 'hi'")
+
+        XCTAssertEqual(r.matches.count, 2)          // both fired
+        XCTAssertEqual(r.highlight, .teal)          // the first one's colour stuck
+    }
+
+    /// An uncoloured rule matching first must not swallow the colour of a later
+    /// one. Plenty of rules exist only to send something, and they sit wherever
+    /// they were added — above a colouring rule as often as below it.
+    func testUncolouredMatchDoesNotBlockALaterColour() {
+        let plain = MatchRule(pattern: "*paged*", sendText: "", keepEvaluating: true)
+        let colour = MatchRule(pattern: "You paged *", keepEvaluating: true, highlight: .blue)
+        XCTAssertEqual(Matcher.evaluate([plain, colour], line: "You paged Caitlin with 'hi'").highlight,
+                       .blue)
+    }
+
+    /// A colouring rule below a rule that stops evaluation never gets a look in.
+    /// That is the existing `keepEvaluating` contract and colour is not special;
+    /// the test is here so it stays deliberate.
+    func testColourBelowAStoppingRuleDoesNotApply() {
+        let stopper = MatchRule(pattern: "*paged*")            // keepEvaluating: false
+        let colour = MatchRule(pattern: "You paged *", highlight: .blue)
+        XCTAssertEqual(Matcher.evaluate([stopper, colour], line: "You paged Caitlin with 'hi'").highlight,
+                       .plain)
+    }
+
+    /// A gagged line is hidden, so its colour is moot — but the two flags are
+    /// independent and one must not clear the other.
+    func testGagAndHighlightAreIndependent() {
+        let t = MatchRule(pattern: "spam*", gag: true, highlight: .red)
+        let r = Matcher.evaluate([t], line: "spam spam spam")
+        XCTAssertTrue(r.gag)
+        XCTAssertEqual(r.highlight, .red)
+    }
+
+    // MARK: Rule persistence
+
+    /// The whole reason `MatchRule` spells its `Codable` out by hand. Every rule
+    /// in every world file written before `highlight` existed lacks the key, and
+    /// the *synthesised* decoder requires every key — a default on the property
+    /// is not consulted. Without the lenient decode each of those rules would
+    /// throw, and a throw inside `worlds.json` costs the entire file: the
+    /// fallback hands back one empty default world and every trigger, alias,
+    /// timer and macro is silently gone.
+    func testRuleWrittenBeforeHighlightExistedStillDecodes() throws {
+        let json = """
+        { "id": "abc", "name": "greet", "pattern": "* waves.", "isRegex": false,
+          "ignoreCase": true, "enabled": true, "sendText": "wave", "script": "",
+          "gag": false, "keepEvaluating": false }
+        """.data(using: .utf8)!
+
+        let rule = try JSONDecoder().decode(MatchRule.self, from: json)
+
+        XCTAssertEqual(rule.highlight, .plain)   // the new field defaults
+        XCTAssertEqual(rule.id, "abc")           // and nothing else was lost
+        XCTAssertEqual(rule.pattern, "* waves.")
+        XCTAssertEqual(rule.sendText, "wave")
+        XCTAssertTrue(rule.enabled)
+    }
+
+    /// Nearly every key absent, not just the new one — a hand-written rule, or
+    /// one from a much older build.
+    func testSparseRuleDecodesToSensibleDefaults() throws {
+        let json = #"{ "pattern": "hello*" }"#.data(using: .utf8)!
+        let rule = try JSONDecoder().decode(MatchRule.self, from: json)
+
+        XCTAssertEqual(rule.pattern, "hello*")
+        XCTAssertEqual(rule.highlight, .plain)
+        XCTAssertTrue(rule.enabled)              // absent means on
+        XCTAssertTrue(rule.ignoreCase)           // absent means insensitive
+        XCTAssertFalse(rule.isRegex)
+        XCTAssertFalse(rule.gag)
+        XCTAssertFalse(rule.id.isEmpty)          // a fresh one is minted
+    }
+
+    /// Same doctrine as `Macro.color`: an unknown or wrong-typed colour costs the
+    /// colour and nothing else, rather than throwing away the rule around it.
+    func testUnknownHighlightNameDecodesAsPlainRatherThanThrowing() throws {
+        let json = #"{ "pattern": "hi*", "highlight": "chartreuse" }"#.data(using: .utf8)!
+        let rule = try JSONDecoder().decode(MatchRule.self, from: json)
+
+        XCTAssertEqual(rule.highlight, .plain)
+        XCTAssertEqual(rule.pattern, "hi*")
+    }
+
+    func testNonStringHighlightDecodesAsPlainRatherThanThrowing() throws {
+        let json = #"{ "pattern": "hi*", "highlight": 4 }"#.data(using: .utf8)!
+        XCTAssertEqual(try JSONDecoder().decode(MatchRule.self, from: json).highlight, .plain)
+    }
+
+    /// Hand-written `encode(to:)` and `init(from:)` are two places to forget a
+    /// field. This catches a colour that saves but doesn't load, or vice versa.
+    func testRuleRoundTripsThroughJSON() throws {
+        let original = MatchRule(id: "r1", name: "pages", pattern: "* pages: *",
+                                 isRegex: false, ignoreCase: false, enabled: true,
+                                 sendText: "reply", script: "s", gag: true,
+                                 keepEvaluating: true, highlight: .purple)
+
+        let data = try JSONEncoder().encode(original)
+        XCTAssertEqual(try JSONDecoder().decode(MatchRule.self, from: data), original)
+    }
 }
 
 // Every test in this file, listed because a plain executable has no runtime
@@ -116,5 +242,17 @@ extension MatcherTests {
         ("testMultilineSendExpansion", { MatcherTests().testMultilineSendExpansion() }),
         ("testWholeMatchWildcardZero", { MatcherTests().testWholeMatchWildcardZero() }),
         ("testTimerModelDefaults", { MatcherTests().testTimerModelDefaults() }),
+        ("testNoHighlightByDefault", { MatcherTests().testNoHighlightByDefault() }),
+        ("testLineThatMatchesNothingIsNotHighlighted", { MatcherTests().testLineThatMatchesNothingIsNotHighlighted() }),
+        ("testHighlightComesFromTheMatchingRule", { MatcherTests().testHighlightComesFromTheMatchingRule() }),
+        ("testFirstColouredRuleWinsNotLast", { MatcherTests().testFirstColouredRuleWinsNotLast() }),
+        ("testUncolouredMatchDoesNotBlockALaterColour", { MatcherTests().testUncolouredMatchDoesNotBlockALaterColour() }),
+        ("testColourBelowAStoppingRuleDoesNotApply", { MatcherTests().testColourBelowAStoppingRuleDoesNotApply() }),
+        ("testGagAndHighlightAreIndependent", { MatcherTests().testGagAndHighlightAreIndependent() }),
+        ("testRuleWrittenBeforeHighlightExistedStillDecodes", { try MatcherTests().testRuleWrittenBeforeHighlightExistedStillDecodes() }),
+        ("testSparseRuleDecodesToSensibleDefaults", { try MatcherTests().testSparseRuleDecodesToSensibleDefaults() }),
+        ("testUnknownHighlightNameDecodesAsPlainRatherThanThrowing", { try MatcherTests().testUnknownHighlightNameDecodesAsPlainRatherThanThrowing() }),
+        ("testNonStringHighlightDecodesAsPlainRatherThanThrowing", { try MatcherTests().testNonStringHighlightDecodesAsPlainRatherThanThrowing() }),
+        ("testRuleRoundTripsThroughJSON", { try MatcherTests().testRuleRoundTripsThroughJSON() }),
     ])
 }

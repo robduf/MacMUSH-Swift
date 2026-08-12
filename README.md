@@ -38,6 +38,32 @@ wherever it is, including in another window, which ⌘1…⌘9 can't do; if it h
 no tab open yet, it gets one. (If ⌃1…⌃4 do nothing, macOS has them: System
 Settings ▸ Keyboard ▸ Keyboard Shortcuts ▸ Mission Control.)
 
+## Colouring what people say
+
+A trigger can repaint the line it matched. Settings ▸ Triggers has a **Color**
+column; pick a shade there and any line that rule matches arrives in it. The
+usual reason is to stop your own half of a conversation looking exactly like
+everyone else's — on a MUSH, both halves come from the server as plain white
+text and there is nothing else to tell them apart by:
+
+| Pattern | Color |
+| --- | --- |
+| `You paged *` | Teal |
+| `* pages: *` | Yellow |
+| `<OOC>*` | Purple |
+
+Leave Send empty; a rule can colour a line without sending anything.
+
+Order matters. Rules are tried top to bottom and a line fires only the first one
+that matches — that rule supplies both the colour and anything sent, and nothing
+below it is tried. So put specific patterns above general ones, and watch for an
+existing trigger that already matches a line you're trying to colour: the colour
+rule underneath it will never be reached.
+
+The colour replaces the line's own ANSI colours but keeps its bold, italics and
+underlines. Highlighting is a display choice, so the session log is unaffected —
+it stays a plain transcript of what the world sent.
+
 ## What you need
 
 The Swift compiler and the macOS SDK. Either:
@@ -106,6 +132,7 @@ Sources/
     WorldConfig.swift     one world: host, port, triggers, aliases, timers
     AppConfig.swift       the saved world list + which one is active
     Matcher.swift         trigger/alias matching (wildcards or regex)
+    Macro.swift           macro buttons, key shortcuts, the shared colour set
     SessionFormat.swift   elapsed time, log filenames, log header/footer
   MacMUSH/            the AppKit app (code-only, no storyboards)
     main.swift            NSApplication entry
@@ -115,8 +142,11 @@ Sources/
     TabBarView.swift      the row of tabs, with connected dot and unread badge
     Session.swift         one tab: socket, text view, input, history, log
     SettingsWindow.swift  world editor (connection, triggers, aliases, logging)
+    MacroPalette.swift    the floating quick-reference buttons
+    ShortcutRecorder.swift  the "press a key" field behind macro hotkeys
     MudConnection.swift   TCP via Network.framework
     Theme.swift           the window's colours, in one place
+    Swatch.swift          the shades behind SwatchColor: fills and text
     AnsiRenderer.swift    MudColor → NSColor, attributed text
     SessionLogger.swift   per-world plain-text session logs
     WorldStore.swift      loads/saves the world list

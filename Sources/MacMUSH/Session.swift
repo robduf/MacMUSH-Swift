@@ -927,16 +927,21 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         pendingPlain = ""
 
         var gagged = false
+        // nil unless a trigger asked for a colour, which is the overwhelmingly
+        // common case — and `append` skips the whole repaint when it's nil, so an
+        // ordinary line costs nothing for this feature existing.
+        var highlight: NSColor?
         if !isPrompt {
             let result = Matcher.evaluate(config.triggers, line: plain)
             gagged = result.gag
+            highlight = result.highlight.textColor
             for match in result.matches where !match.sendText.isEmpty {
                 send(match.sendText, echo: false)
             }
         }
 
         if !gagged {
-            renderer.append(lineOps + [.newline], to: textView)
+            renderer.append(lineOps + [.newline], to: textView, highlight: highlight)
             textView.scrollToEndOfDocument(nil)
             // A gagged line stays out of the log too — if a trigger hid it from
             // you, writing it to disk anyway would be a nasty surprise.
