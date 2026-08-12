@@ -118,9 +118,19 @@ node scripts/fake-mud.js        # listens on 127.0.0.1:4000
 
 ## Build the .app
 
-Double-click **`Build MacMUSH.command`** (or run it), which compiles a release
-build and assembles `dist/MacMUSH.app` with its icon, ready to drag into
-Applications.
+Double-click **`Build MacMUSH.command`** (or run it). It compiles a release
+build, assembles `dist/MacMUSH.app` with its icon, and installs it.
+
+The first time it asks whether to put it in `/Applications`. After that it just
+keeps the installed copy up to date, because a build that stays in `dist/` is a
+build you aren't running — the trap being that you fix something, rebuild, launch
+the copy in Applications and spend an hour wondering where the fix went. It won't
+overwrite a copy that's currently running; it says so and waits for you to quit.
+
+It restarts the Dock on the way out, which takes a second and loses nothing. That
+is the only reliable way to make macOS notice a changed icon at a path it has
+already cached — without it a rebuilt app keeps showing the old icon, or the
+generic one, however correct the bundle is.
 
 ## Tests
 

@@ -65,12 +65,62 @@ PLIST
 echo "✓ Bundle assembled"
 
 # ---- 4. Ad-hoc sign + refresh Finder ----------------------------------
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 codesign --force --deep -s - "$APP" 2>/dev/null || true
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
+"$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
 touch "$APP" 2>/dev/null || true
+
+# ---- 5. Install into /Applications ------------------------------------
+# Because a build that stays in dist/ is a build you are not running. Copy it
+# there once by hand and every later build lands on top of it, which is the
+# whole point: otherwise you fix something, rebuild, launch the copy in
+# Applications, and spend an hour wondering why the fix isn't there.
+INSTALLED="/Applications/MacMUSH.app"
+DO_INSTALL=no
+
+if [ -d "$INSTALLED" ]; then
+  DO_INSTALL=yes                    # already installed: keep it up to date
+else
+  echo ""
+  printf "Install into /Applications? [y/N] "
+  # `|| answer=""` because `set -e` is on and a `read` with no tty to read from
+  # fails — which would abort the whole build at the last step, after it had
+  # already succeeded, for a question nobody was there to answer.
+  read -r answer || answer=""
+  case "$answer" in [Yy]*) DO_INSTALL=yes ;; esac
+fi
+
+if [ "$DO_INSTALL" = yes ]; then
+  # Replacing the bundle underneath a running copy leaves it half old and half
+  # new — the executable it already mapped, the resources it hasn't loaded yet.
+  if pgrep -x MacMUSH >/dev/null 2>&1; then
+    echo "⚠︎  MacMUSH is running. Quit it (⌘Q) and press return to continue,"
+    printf "   or press Ctrl-C to leave the installed copy alone. "
+    read -r _ || true
+  fi
+
+  # rm first, rather than copying over the top: a stale file from an older
+  # build that this one no longer produces would otherwise survive forever.
+  if rm -rf "$INSTALLED" 2>/dev/null && cp -R "$APP" "$INSTALLED" 2>/dev/null; then
+    "$LSREGISTER" -f "$INSTALLED" >/dev/null 2>&1 || true
+    touch "$INSTALLED" 2>/dev/null || true
+    echo "✓ Installed  $INSTALLED"
+
+    # The Dock caches icons hard, and a rebuilt app at a path it has already
+    # seen is exactly the case it gets wrong — you get the old icon, or the
+    # generic one, and nothing you do to the bundle changes it. Restarting the
+    # Dock is the reliable fix; it takes about a second and loses nothing.
+    killall Dock 2>/dev/null || true
+  else
+    echo "⚠︎  Couldn't write to /Applications. Drag dist/MacMUSH.app there yourself,"
+    echo "   or run:  sudo cp -R \"$PWD/$APP\" /Applications/"
+  fi
+fi
 
 echo ""
 echo "${BOLD}✓ Done!${NORM}  $PWD/$APP"
-echo "Drag MacMUSH.app into Applications, or run it right here."
-open dist 2>/dev/null || true
+if [ "$DO_INSTALL" != yes ]; then
+  echo "Drag MacMUSH.app into Applications, or run it right here."
+  open dist 2>/dev/null || true
+fi
 read -n 1 -s -r -p "Press any key to close…"; echo ""
