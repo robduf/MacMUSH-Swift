@@ -1499,20 +1499,49 @@ final class Session: NSObject, NSTextViewDelegate, NSSplitViewDelegate {
         return true
     }
 
+    /// Put a line break in the command box.
+    ///
+    /// `insertText` rather than AppKit's own `insertLineBreak(_:)`, which inserts
+    /// U+2028 LINE SEPARATOR. That looks like a newline on screen and is not one:
+    /// `components(separatedBy: "\n")` in `sendFromInput` doesn't split on it, so
+    /// the whole pose would go out as one line with a stray character sitting in
+    /// the middle of it — and `OutgoingText.tidy` would then drop that character,
+    /// silently welding two lines together.
+    private func insertRealNewline(into textView: NSTextView) {
+        textView.insertText("\n", replacementRange: textView.selectedRange)
+    }
+
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard textView === inputView else { return false }
 
         switch commandSelector {
         case #selector(NSResponder.insertNewline(_:)):
+            // Shift-Return has to be told apart from Return *here*, by looking at
+            // the event, because AppKit will not do it for us. Shift is not in
+            // the standard key-binding table at all for Return: it is part of how
+            // a character is produced, not a command modifier, so ⇧↩ arrives as
+            // plain `insertNewline:` — indistinguishable from ↩ unless you ask
+            // what was actually held down. The cases below cover ⌃↩ and ⌥↩, which
+            // *are* in the table, and covering Shift by adding it to that list is
+            // the mistake this replaces: the selector never arrives, so the
+            // placeholder advertised a key that sent your half-written pose.
+            //
+            // `NSApp.currentEvent` is the key event: `doCommandBy` runs
+            // synchronously inside `interpretKeyEvents`, still within `keyDown`.
+            let modifiers = NSApp.currentEvent?.modifierFlags
+                .intersection(.deviceIndependentFlagsMask) ?? []
+            if modifiers.contains(.shift) {
+                insertRealNewline(into: textView)
+                return true
+            }
             sendFromInput()
             return true
 
         case #selector(NSResponder.insertLineBreak(_:)),
              #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            // Shift-Return and Option-Return. AppKit's own insertLineBreak puts
-            // in U+2028, which would go down the socket as a stray character —
-            // insert a real newline instead.
-            textView.insertText("\n", replacementRange: textView.selectedRange)
+            // ⌃↩ and ⌥↩ respectively — both kept, because both are muscle memory
+            // for somebody and neither costs anything.
+            insertRealNewline(into: textView)
             return true
 
         case #selector(NSResponder.moveUp(_:)):
